@@ -107,7 +107,7 @@ class PDFPipelineConverter:
         except Exception as exc:
             logging.warning("Полнота: не открыть PDF %s: %s", pdf_path.name, exc)
             return
-        missing: list[str] = []
+        missing: list[tuple[int, str]] = []   # (номер страницы, строка)
         seen: set[str] = set()
         src_chars = 0
         for i in range(pdf.page_count):
@@ -125,7 +125,7 @@ class PDFPipelineConverter:
                     key = self._norm(s)
                     if key not in seen:     # не дописываем одну и ту же строку дважды
                         seen.add(key)
-                        missing.append(s)
+                        missing.append((i + 1, s))
         pdf.close()
 
         if src_chars < 50:                  # PDF без текстового слоя (скан) — сверять нечего
@@ -137,7 +137,11 @@ class PDFPipelineConverter:
         try:
             d.add_page_break()
             d.add_paragraph("[Восстановленный текст — pdf2docx не перенёс эти строки в вёрстку]")
-            for s in missing:
+            cur_page = None
+            for page_no, s in missing:
+                if page_no != cur_page:     # заголовок-ориентир: откуда взята строка
+                    cur_page = page_no
+                    d.add_paragraph(f"— страница {page_no} —")
                 d.add_paragraph(s)
             d.save(str(docx_path))
             logging.warning("%s: pdf2docx потерял %d строк — дописаны в конец DOCX "
@@ -186,19 +190,34 @@ class PDFPipelineConverter:
             glue.pop(key, None)
         return glue
 
-    @staticmethod
-    def _unglue(token: str, glue: dict[str, list[int]]) -> str:
+    # Обрамляющая пунктуация, которую pdf2docx может приклеить к токену иначе,
+    # чем PyMuPDF разбил слова (кавычки, скобки, знаки препинания по краям).
+    _EDGE_PUNCT = "«»\"'()[]{}.,;:!?—–-…"
+
+    @classmethod
+    def _unglue(cls, token: str, glue: dict[str, list[int]]) -> str:
         """Вставляет пробелы в склеенный токен по известным из PDF границам.
-        Символы DOCX не заменяются — сохраняется точный регистр/написание."""
+        Символы DOCX не заменяются — сохраняется точный регистр/написание.
+        При промахе повторяет поиск без обрамляющей пунктуации: pdf2docx и
+        PyMuPDF по-разному приклеивают кавычки/скобки к словам."""
         bounds = glue.get(token.lower())
+        head = tail = ""
         if not bounds:
-            return token
+            core = token.strip(cls._EDGE_PUNCT)
+            if not core or core == token:
+                return token
+            i = token.find(core)
+            head, tail = token[:i], token[i + len(core):]
+            bounds = glue.get(core.lower())
+            if not bounds:
+                return token
+            token = core
         parts, prev = [], 0
         for b in bounds:
             parts.append(token[prev:b])
             prev = b
         parts.append(token[prev:])
-        return " ".join(p for p in parts if p)
+        return head + " ".join(p for p in parts if p) + tail
 
     def _fix_paragraph(self, paragraph, glue: dict[str, list[int]]) -> int:
         """Чинит склейки в одном абзаце на двух уровнях:

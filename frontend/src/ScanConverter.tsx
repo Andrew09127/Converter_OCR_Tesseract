@@ -227,6 +227,103 @@ export default function ScanConverter() {
             )}
           </Box>
 
+          <Alert severity={statusKind} variant="outlined">{status}</Alert>
+
+          {/* Две карточки режимов с пояснениями.
+              Анализатор подсвечивает рекомендованную карточку зелёной рамкой и делает
+              её кнопку «success»-зелёной; обе кнопки остаются активны — выбор за пользователем. */}
+          <Stack direction={{ xs: "column", sm: "row" }} spacing={2} alignItems="stretch">
+            {/* Скан-режим */}
+            {(() => {
+              const recommended = suggestedMode === "scan";
+              return (
+            <Box sx={{ flex: 1, p: 2, borderRadius: 2, display: "flex", flexDirection: "column",
+                       border: "2px solid", borderColor: recommended ? "success.main" : "#E5E7EB",
+                       bgcolor: recommended ? "#F0FBF2" : "#fff", transition: "all .2s" }}>
+              <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.5 }}>
+                <PsychologyIcon color="primary" fontSize="small" />
+                <Typography variant="subtitle2" fontWeight={700}>
+                  Отсканированный PDF
+                </Typography>
+                {recommended && (
+                  <Chip label="рекомендуем" size="small" color="success"
+                        sx={{ ml: "auto", fontWeight: 600, height: 20 }} />
+                )}
+              </Box>
+              <Typography variant="caption" color="text.secondary" sx={{ mb: 1.5, flexGrow: 1 }}>
+                Для документов-изображений (фото и сканы), где текст нельзя выделить.
+                Распознаёт текст и восстанавливает структуру с помощью ИИ. Точнее, но
+                заметно медленнее — учитывает настройки выше.
+              </Typography>
+              <Button
+                fullWidth
+                size="large"
+                variant={recommended ? "contained" : "outlined"}
+                color={recommended ? "success" : "primary"}
+                startIcon={<PsychologyIcon />}
+                disabled={!file || busy || analyzing}
+                onClick={() => convert("scan")}
+              >
+                Конвертировать скан
+              </Button>
+            </Box>
+              );
+            })()}
+
+            {/* Нативный режим */}
+            {(() => {
+              const recommended = suggestedMode === "native";
+              return (
+            <Box sx={{ flex: 1, p: 2, borderRadius: 2, display: "flex", flexDirection: "column",
+                       border: "2px solid", borderColor: recommended ? "success.main" : "#E5E7EB",
+                       bgcolor: recommended ? "#F0FBF2" : "#fff", transition: "all .2s" }}>
+              <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.5 }}>
+                <DescriptionIcon color="primary" fontSize="small" />
+                <Typography variant="subtitle2" fontWeight={700}>
+                  Неотсканированный PDF
+                </Typography>
+                {recommended && (
+                  <Chip label="рекомендуем" size="small" color="success"
+                        sx={{ ml: "auto", fontWeight: 600, height: 20 }} />
+                )}
+              </Box>
+              <Typography variant="caption" color="text.secondary" sx={{ mb: 1.5, flexGrow: 1 }}>
+                Для документов с текстовым слоем (текст выделяется и копируется).
+                Переносит текст, таблицы и картинки напрямую — быстро и точно.
+                Распознавание и настройки выше не используются.
+              </Typography>
+              <Button
+                fullWidth
+                size="large"
+                variant={recommended ? "contained" : "outlined"}
+                color={recommended ? "success" : "primary"}
+                startIcon={<DescriptionIcon />}
+                disabled={!file || busy || analyzing}
+                onClick={() => convert("native")}
+              >
+                Конвертировать PDF
+              </Button>
+            </Box>
+              );
+            })()}
+          </Stack>
+
+          {/* Прогресс — показывается только во время конвертации и после её завершения */}
+          {(busy || progress > 0) && (
+            <Box>
+              <Box sx={{ display: "flex", justifyContent: "space-between", mb: 0.5 }}>
+                <Typography variant="body2" color="text.secondary">Прогресс</Typography>
+                <Typography variant="body2" color="text.secondary">{progress}%</Typography>
+              </Box>
+              <LinearProgress
+                variant={busy && progress === 0 ? "indeterminate" : "determinate"}
+                value={progress}
+                color={statusKind === "success" ? "success" : "primary"}
+                sx={{ height: 10, borderRadius: 5 }}
+              />
+            </Box>
+          )}
+
           {/* Флаги (применяются к скан-режиму) */}
           <Accordion disableGutters sx={{ borderRadius: 2, "&:before": { display: "none" } }}
                      variant="outlined">
@@ -314,9 +411,8 @@ export default function ScanConverter() {
                 (текст выделяется и копируется). Работает быстро и точно.
               </Typography>
               <Typography variant="caption" color="text.secondary">
-                Не уверены? Попробуйте сначала «Неотсканированный PDF»: если результат
-                окажется пустым или сломанным — значит документ отсканированный, запустите
-                второй режим.
+                Не уверены? Загрузите файл — конвертер сам определит тип документа и
+                подсветит рекомендуемый режим зелёным.
               </Typography>
 
               <Divider sx={{ my: 1.5 }} />
@@ -331,101 +427,6 @@ export default function ScanConverter() {
               </Typography>
             </AccordionDetails>
           </Accordion>
-
-          {/* Прогресс */}
-          <Box>
-            <Box sx={{ display: "flex", justifyContent: "space-between", mb: 0.5 }}>
-              <Typography variant="body2" color="text.secondary">Прогресс</Typography>
-              <Typography variant="body2" color="text.secondary">{progress}%</Typography>
-            </Box>
-            <LinearProgress
-              variant={busy && progress === 0 ? "indeterminate" : "determinate"}
-              value={progress}
-              color={statusKind === "success" ? "success" : "primary"}
-              sx={{ height: 10, borderRadius: 5 }}
-            />
-          </Box>
-
-          <Alert severity={statusKind} variant="outlined">{status}</Alert>
-
-          {/* Две карточки режимов с пояснениями.
-              Анализатор подсвечивает рекомендованную карточку зелёной рамкой и делает
-              её кнопку «success»-зелёной; обе кнопки остаются активны — выбор за пользователем. */}
-          <Stack direction={{ xs: "column", sm: "row" }} spacing={2} alignItems="stretch">
-            {/* Скан-режим */}
-            {(() => {
-              const recommended = suggestedMode === "scan";
-              return (
-            <Box sx={{ flex: 1, p: 2, borderRadius: 2, display: "flex", flexDirection: "column",
-                       border: "2px solid", borderColor: recommended ? "success.main" : "#E5E7EB",
-                       bgcolor: recommended ? "#F0FBF2" : "#fff", transition: "all .2s" }}>
-              <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.5 }}>
-                <PsychologyIcon color="primary" fontSize="small" />
-                <Typography variant="subtitle2" fontWeight={700}>
-                  Отсканированный PDF
-                </Typography>
-                {recommended && (
-                  <Chip label="рекомендуем" size="small" color="success"
-                        sx={{ ml: "auto", fontWeight: 600, height: 20 }} />
-                )}
-              </Box>
-              <Typography variant="caption" color="text.secondary" sx={{ mb: 1.5, flexGrow: 1 }}>
-                Для документов-изображений (фото и сканы), где текст нельзя выделить.
-                Распознаёт текст и восстанавливает структуру с помощью ИИ. Точнее, но
-                заметно медленнее — учитывает настройки выше.
-              </Typography>
-              <Button
-                fullWidth
-                size="large"
-                variant={recommended ? "contained" : "outlined"}
-                color={recommended ? "success" : "primary"}
-                startIcon={<PsychologyIcon />}
-                disabled={!file || busy || analyzing}
-                onClick={() => convert("scan")}
-              >
-                Конвертировать скан
-              </Button>
-            </Box>
-              );
-            })()}
-
-            {/* Нативный режим */}
-            {(() => {
-              const recommended = suggestedMode === "native";
-              return (
-            <Box sx={{ flex: 1, p: 2, borderRadius: 2, display: "flex", flexDirection: "column",
-                       border: "2px solid", borderColor: recommended ? "success.main" : "#E5E7EB",
-                       bgcolor: recommended ? "#F0FBF2" : "#fff", transition: "all .2s" }}>
-              <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.5 }}>
-                <DescriptionIcon color="primary" fontSize="small" />
-                <Typography variant="subtitle2" fontWeight={700}>
-                  Неотсканированный PDF
-                </Typography>
-                {recommended && (
-                  <Chip label="рекомендуем" size="small" color="success"
-                        sx={{ ml: "auto", fontWeight: 600, height: 20 }} />
-                )}
-              </Box>
-              <Typography variant="caption" color="text.secondary" sx={{ mb: 1.5, flexGrow: 1 }}>
-                Для документов с текстовым слоем (текст выделяется и копируется).
-                Переносит текст, таблицы и картинки напрямую — быстро и точно.
-                Распознавание и настройки выше не используются.
-              </Typography>
-              <Button
-                fullWidth
-                size="large"
-                variant={recommended ? "contained" : "outlined"}
-                color={recommended ? "success" : "primary"}
-                startIcon={<DescriptionIcon />}
-                disabled={!file || busy || analyzing}
-                onClick={() => convert("native")}
-              >
-                Конвертировать PDF
-              </Button>
-            </Box>
-              );
-            })()}
-          </Stack>
         </Stack>
       </Paper>
 
