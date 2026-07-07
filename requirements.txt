@@ -1,0 +1,29 @@
+# Прямые зависимости конвертера (онлайн-установка, читаемый список).
+# Для ТОЧНОЙ воспроизводимой/офлайн-установки используйте requirements-lock.txt
+# (полный слепок всех 127 пакетов) — см. README.md.
+
+# --- Ядро: конвертация PDF → DOCX ---
+pdf2docx==0.5.13            # нативные PDF (есть текстовый слой)
+PyMuPDF>=1.26.7
+python-docx>=0.8.10
+PyPDF2>=3.0.0
+Pillow>=10.0.0
+opencv-python>=4.6.0
+docxcompose>=1.4.0
+
+# --- OCR для сканов ---
+# Движок — Docling + Tesseract (CLI). Бинарник Tesseract >= 5 (rus, eng, osd)
+# вендорен в vendor/tesseract/ (Windows) — установка не нужна, полный офлайн.
+# Альтернатива: системная установка (UB Mannheim,
+# https://github.com/UB-Mannheim/tesseract/wiki) — подхватится автоматически.
+pytesseract>=0.3.13         # обёртка над tesseract CLI (для word_order)
+
+# --- Веб-слой локального API (main.py + docling_dev/api.py) ---
+fastapi>=0.137
+uvicorn>=0.49
+python-multipart>=0.0.32
+
+# --- Опциональная локальная LLM-доочистка (режим скана / флаг --llm) ---
+# CPU-wheel без компиляции:
+#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+llama-cpp-python>=0.3.0
