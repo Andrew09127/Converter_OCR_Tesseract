@@ -1,0 +1,7 @@
+# Вендоренные бинари и модели: никаких конверсий переводов строк —
+# файлы должны попадать на диск байт-в-байт (tessdata-конфиги Tesseract
+# чувствительны к CRLF, куски моделей и wheel'ы — бинарные).
+vendor/tesseract/** -text
+models/** -text
+offline_kit/wheels/** -text
+tests/golden/** -text
