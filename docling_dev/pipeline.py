@@ -142,15 +142,20 @@ def build_converter(
     if langs is None:
         langs = ["ru", "en"]
 
-    # Предобработка изображения перед Tesseract (deskew + CLAHE-контраст). ОПЦИЯ
-    # (по умолчанию ВЫКЛ): помогает плохим сканам (наклон, серый фон, бледность),
-    # но на хороших сканах может дать артефакты. Включать флагом --ocr-preprocess.
-    if ocr_preprocess:
-        try:
-            from .ocr_preprocess import install_tesseract_preprocess
-            install_tesseract_preprocess()
-        except Exception as _exc:
-            log.debug("ocr_preprocess недоступен: %s", _exc)
+    # Предобработка изображения перед Tesseract.
+    # despeckle (удаление пятен/грязи скана) — ВСЕГДА ВКЛ: строкоцентричный
+    # алгоритм консервативен, на чистых сканах ему нечего удалять.
+    # deskew + CLAHE-контраст — только под флагом --ocr-preprocess: помогают
+    # плохим сканам (наклон, серый фон), но на хороших могут дать артефакты.
+    try:
+        from .ocr_preprocess import install_tesseract_preprocess
+        install_tesseract_preprocess(
+            deskew=ocr_preprocess,
+            clahe=ocr_preprocess,
+            despeckle=True,
+        )
+    except Exception as _exc:
+        log.debug("ocr_preprocess недоступен: %s", _exc)
 
     ocr_opts = _tesseract_options(langs)
 

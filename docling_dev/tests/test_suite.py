@@ -1000,3 +1000,141 @@ def test_dash_negative_number_kept():
     """Дефис перед цифрой — минус числа, не буллет: не срезается."""
     pat = re.compile(r'^\s*[-–—•·]\s*(?=[^\W\d])')
     assert pat.sub('', "-5 000 руб.") == "-5 000 руб."
+
+
+#  OCR PREPROCESS — remove_stains (удаление пятен со скана)
+
+from docling_dev.ocr_preprocess import remove_stains as _remove_stains
+
+
+def _synth_page():
+    """Синтетический скан 900x700: 4 строки «текста» из букв-прямоугольников."""
+    img = _np.full((700, 900), 255, dtype=_np.uint8)
+    for row_y in (100, 150, 200, 250):
+        x = 150
+        for word in range(8):
+            for letter in range(5):
+                img[row_y:row_y + 20, x:x + 12] = 0
+                x += 16
+            x += 14                      # межсловный пробел
+    return img
+
+
+@_need_cv2
+def test_stains_text_kept():
+    """Чистый синтетический текст не изменяется."""
+    img = _synth_page()
+    out = _remove_stains(img)
+    assert int((img != out).sum()) == 0
+
+
+@_need_cv2
+def test_stains_blob_removed():
+    """Клякса в левом поле (вне строк) удаляется, текст цел."""
+    img = _synth_page()
+    img[120:240, 30:80] = 0              # вертикальная грязевая полоса в поле
+    out = _remove_stains(img)
+    assert (out[120:240, 30:80] == 255).all()          # полоса стёрта
+    assert (out[100:120, 150:162] == 0).any()          # буквы на месте
+
+
+@_need_cv2
+def test_stains_specks_removed():
+    """Россыпь мелких точек («соль-перец») удаляется."""
+    img = _synth_page()
+    for y, x in ((60, 300), (300, 500), (400, 100), (55, 700)):
+        img[y:y + 2, x:x + 2] = 0
+    out = _remove_stains(img)
+    for y, x in ((60, 300), (300, 500), (400, 100), (55, 700)):
+        assert (out[y:y + 2, x:x + 2] == 255).all()
+
+
+@_need_cv2
+def test_stains_thin_line_kept():
+    """Тонкая длинная линия (рамка таблицы/подчёркивание) сохраняется."""
+    img = _synth_page()
+    img[300:302, 150:750] = 0            # горизонтальная линия
+    out = _remove_stains(img)
+    assert (out[300:302, 200:700] == 0).any()
+
+
+@_need_cv2
+def test_stains_short_token_near_row_kept():
+    """Короткий токен («1.»), отделённый пробелом от строки, не удаляется."""
+    img = _synth_page()
+    img[100:120, 100:112] = 0            # «цифра» слева от строки (зазор 38px)
+    out = _remove_stains(img)
+    assert (out[100:120, 100:112] == 0).any()
+
+
+@_need_cv2
+def test_stains_isolated_mark_removed():
+    """Одиночная метка вдали от текста (грязь) удаляется."""
+    img = _synth_page()
+    img[500:512, 400:412] = 0            # клякса 12x12 в пустой зоне
+    out = _remove_stains(img)
+    assert (out[500:512, 400:412] == 255).all()
+
+
+#  OCR PREPROCESS — штампы и фильтр мусорных картинок
+
+from docling_dev.ocr_preprocess import is_junk_image as _is_junk_image
+
+
+def _add_stamp(img, x0=600, y0=400, w=300, h=120):
+    """Рисует рамку штампа с «текстом» и «росписью» внутри."""
+    img[y0:y0 + 2, x0:x0 + w] = 0            # верх
+    img[y0 + h - 2:y0 + h, x0:x0 + w] = 0    # низ
+    img[y0:y0 + h, x0:x0 + 2] = 0            # лево
+    img[y0:y0 + h, x0 + w - 2:x0 + w] = 0    # право
+    for lx in range(x0 + 20, x0 + 200, 16):  # строка «текста» внутри
+        img[y0 + 30:y0 + 45, lx:lx + 10] = 0
+    return img
+
+
+@_need_cv2
+def test_stamp_removed_with_contents():
+    """Рамка штампа и содержимое внутри неё удаляются, текст документа цел."""
+    img = _synth_page()
+    _add_stamp(img)
+    out = _remove_stains(img)
+    assert (out[400:520, 600:900] == 255).all()        # штамп стёрт целиком
+    assert (out[100:120, 150:162] == 0).any()          # текст на месте
+
+
+@_need_cv2
+def test_junk_image_speckle():
+    """Кроп-россыпь крапинок (грязевая полоса) — мусор."""
+    from PIL import Image as _PILImage
+    rng = _np.random.default_rng(7)
+    img = _np.full((400, 80), 255, dtype=_np.uint8)   # узкая полоса, как у сшивки
+    for _ in range(60):
+        y, x = int(rng.integers(0, 390)), int(rng.integers(0, 70))
+        img[y:y + int(rng.integers(2, 8)), x:x + int(rng.integers(2, 8))] = 0
+    assert _is_junk_image(_PILImage.fromarray(img)) is True
+
+
+@_need_cv2
+def test_junk_image_text_not_junk():
+    """Кроп с обычными текстовыми строками — НЕ мусор."""
+    from PIL import Image as _PILImage
+    img = _synth_page()[80:280, 100:800]
+    assert _is_junk_image(_PILImage.fromarray(img)) is False
+
+
+@_need_cv2
+def test_junk_image_stamp():
+    """Кроп со штампом (рамка на весь кроп) — мусор."""
+    from PIL import Image as _PILImage
+    img = _np.full((160, 340), 255, dtype=_np.uint8)
+    _add_stamp(img, x0=10, y0=10, w=320, h=140)
+    assert _is_junk_image(_PILImage.fromarray(img)) is True
+
+
+@_need_cv2
+def test_junk_image_solid_logo_kept():
+    """Сплошная эмблема (мало компонент, без строк) — НЕ мусор."""
+    from PIL import Image as _PILImage
+    img = _np.full((200, 200), 255, dtype=_np.uint8)
+    _cv2.circle(img, (100, 100), 70, 0, -1)
+    assert _is_junk_image(_PILImage.fromarray(img)) is False

@@ -39,6 +39,7 @@ from .geometry import (
     detect_pdf_native, sort_reading_order,
 )
 from .ocr_fixes import postprocess
+from .ocr_preprocess import is_junk_image
 from .page_analyser import (
     analyse_pages as analyse_page_infos,
     build_indent_levels, snap_indent,
@@ -1508,6 +1509,10 @@ def _render_first_page_letterhead(
     pil_img = _get_item_image(pic_item, dl_doc)
     if pil_img is None:
         return _empty
+    # Грязевая полоса/штамп, принятые за логотип шапки, — шапку не строим
+    if is_junk_image(pil_img):
+        log.info("letterhead: картинка — мусор скана (пятно/штамп), пропуск")
+        return _empty
 
     text_w_inch = (pw - 2 * MARGIN_INCH * 72) / 72
     pic_l = float(getattr(pic_bbox, "l", 0.0))
@@ -2287,6 +2292,12 @@ def build_docx(
                 if pil_img is None:
                     log.debug("[стр%d] %s: изображение недоступно — пропуск", page_no, lbl)
                     continue
+                # Мусорные «картинки»: layout-модель принимает грязевые полосы
+                # и канцелярские штампы за рисунки — в DOCX их не вставляем.
+                if is_junk_image(pil_img):
+                    log.info("[стр%d] %s: мусорная картинка (пятно/штамп) — пропуск",
+                             page_no, lbl)
+                    continue
                 log.info("[стр%d] %s: %dx%d px", page_no, lbl, pil_img.width, pil_img.height)
                 text_w_inch = (pw - 2 * MARGIN_INCH * 72) / 72
                 text_h_inch = (ph - 2 * MARGIN_INCH * 72) / 72
@@ -2375,6 +2386,12 @@ def build_docx(
         text = postprocess(raw_text)
         if not text:
             log.debug("[стр%d] idx=%d lbl=%s: пустой текст — пропуск", page_no, idx, lbl)
+            continue
+        # Блок без единой буквы/цифры («`», «;», «?» …) — OCR-шум от остатков
+        # пятен/штампов: отдельный абзац из знаков препинания смысла не несёт.
+        if lbl in ("text", "paragraph", "list_item") \
+                and not re.search(r"[A-Za-zА-Яа-яЁё0-9]", text):
+            log.info("[стр%d] пропуск шум-блока (нет букв/цифр): %r", page_no, text[:20])
             continue
 
         # Логируем значимые исправления OCR (изменение >= 3 символов или 5% текста)
