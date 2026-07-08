@@ -36,9 +36,13 @@ from .docx_builder import (
 )
 from .geometry import (
     bbox_h, bbox_mid_y, bbox_x0, coplanar,
-    detect_pdf_native, reading_order_key,
+    detect_pdf_native, sort_reading_order,
 )
 from .ocr_fixes import postprocess
+from .page_analyser import (
+    analyse_pages as analyse_page_infos,
+    build_indent_levels, snap_indent,
+)
 from .pipeline import build_converter
 from .word_order import TextBlock, blocks_for_page
 
@@ -1647,16 +1651,33 @@ def build_docx(
     log.info("build_docx: %d элементов из Docling, %d страниц",
              len(all_items), len(page_sizes))
 
-    # Базовая сортировка в порядке чтения по Docling-координатам
+    # Базовая сортировка в порядке чтения по Docling-координатам.
+    # Построчная кластеризация (sort_reading_order) вместо бинов 40pt:
+    # бин покрывал 2-3 строки, и блоки соседних строк сортировались по X —
+    # свап пунктов списка, перемешивание слов на фрагментированных сканах.
     pdf_native = detect_pdf_native(all_items)
     log.info("build_docx: pdf_native=%s (система координат Docling)", pdf_native)
-    all_items.sort(key=lambda x: reading_order_key(x, pdf_native))
+    all_items = sort_reading_order(all_items, pdf_native)
 
     page_medians, page_left_min = analyse_pages(all_items)
     for pn in sorted(page_sizes):
         log.info("  стр.%d: %.0f×%.0f pt, median_h=%.1f px, left_min=%.1f pt",
                  pn, page_sizes[pn][0], page_sizes[pn][1],
                  page_medians.get(pn, 0.0), page_left_min.get(pn, 0.0))
+
+    # Модель страницы: колонки (page_analyser.PageInfo) + уровни отступов.
+    # Колонки: блоку в правой колонке multicolumn-страницы выравнивание
+    # считается относительно СВОЕЙ колонки, а не всей страницы.
+    # Уровни отступов: сырые x0 «дрожат» на 1-4pt (шум OCR) — прищёлкиваем
+    # каждый блок к ближайшему уровню документа, вертикали текста ровные.
+    page_infos = analyse_page_infos(all_items)
+    for pn, _pi in sorted(page_infos.items()):
+        if _pi.is_multicolumn:
+            log.info("  стр.%d: MULTICOLUMN %s", pn,
+                     [(round(c.x0), round(c.x1)) for c in _pi.columns])
+    indent_levels = build_indent_levels(all_items, page_left_min)
+    log.info("Уровни отступов документа (pt от левого поля): %s",
+             [round(lv, 1) for lv in indent_levels])
 
     # word_order: строим карту блоков {page_no: (blocks, img_h_px)},
     # затем пересортировываем all_items по позициям этих блоков.
@@ -2378,15 +2399,17 @@ def build_docx(
         
         """
         Левый отступ блока относительно левого края контента страницы.
-        Раньше отступ > 25% ширины обнулялся — глубоко сдвинутые блоки теряли
-        позицию. Теперь сохраняем отступ почти как в PDF: порог шума 4pt
-        (мелкий сдвиг bbox игнорируем), верхний предел 45% ширины (защита от мусора).
+        Сырой отступ прищёлкивается к ближайшему уровню документа
+        (build_indent_levels): OCR-шум в 1-4pt не разъезжает вертикали,
+        блоки одного отступа встают ровно в одну линию. Порог шума 4pt,
+        верхний предел 45% ширины (защита от мусора) — как раньше.
         """
         indent_pt = 0.0
         if bbox is not None:
             raw_indent = float(getattr(bbox, "l", 0)) - page_left_min.get(page_no, 0.0)
-            if raw_indent >= 4.0:
-                indent_pt = round(min(raw_indent, pw * 0.45), 1)
+            snapped = snap_indent(raw_indent, indent_levels)
+            if snapped > 0.0:
+                indent_pt = round(min(snapped, pw * 0.45), 1)
 
         alignment = (
             detect_alignment(bbox, pw)
@@ -2395,12 +2418,32 @@ def build_docx(
         )
 
         # Корректировка ложного выравнивания для body text:
-        # – CENTER для блоков шире 50% страницы - JUSTIFY 
+        # – блок в правой колонке multicolumn-страницы — относительно КОЛОНКИ
+        # – CENTER для блоков шире 50% страницы - JUSTIFY
         # – RIGHT для блоков, начинающихся в левых 30% страницы - JUSTIFY
         if lbl in ("paragraph", "text") and bbox is not None:
             bw    = float(getattr(bbox, "r", pw)) - float(getattr(bbox, "l", 0))
             raw_x0 = float(getattr(bbox, "l", 0))
-            if alignment == WD_ALIGN_PARAGRAPH.CENTER and bw / pw >= 0.50:
+            # Модель колонок: блок правой колонки живёт в системе координат
+            # СВОЕЙ колонки — CENTER/RIGHT относительно страницы для него ложны.
+            # Заполняет колонку и длинный — JUSTIFY; иначе LEFT, позицию задаёт
+            # left_indent (край колонки, уже прищёлкнутый к уровню отступов).
+            _pinfo = page_infos.get(page_no)
+            _col_idx = (_pinfo.column_for_x(raw_x0)
+                        if _pinfo is not None and _pinfo.is_multicolumn else -1)
+            if _col_idx > 0:
+                _col   = _pinfo.columns[_col_idx]
+                _col_w = max(_col.x1 - _col.x0, 1.0)
+                _col_align = (WD_ALIGN_PARAGRAPH.JUSTIFY
+                              if bw / _col_w >= 0.85 and len(text) > 80
+                              else WD_ALIGN_PARAGRAPH.LEFT)
+                if _col_align != alignment:
+                    log.debug("[стр%d] колонка %d: align %s → %s  %r",
+                              page_no, _col_idx,
+                              _align_names.get(alignment, "?"),
+                              _align_names.get(_col_align, "?"), text[:40])
+                alignment = _col_align
+            elif alignment == WD_ALIGN_PARAGRAPH.CENTER and bw / pw >= 0.50:
                 alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             elif alignment == WD_ALIGN_PARAGRAPH.RIGHT and raw_x0 < pw * 0.30:
                 alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
@@ -2695,10 +2738,13 @@ def build_docx(
                     and alignment != WD_ALIGN_PARAGRAPH.CENTER):
                 alignment = WD_ALIGN_PARAGRAPH.LEFT
                 para.alignment = alignment
-                para.paragraph_format.left_indent = Pt(max(_h_x0 - _h_lm, 0.0))
+                # Отступ прищёлкиваем к уровню документа — метка встаёт в одну
+                # вертикаль с текстовыми блоками той же колонки.
+                para.paragraph_format.left_indent = Pt(
+                    snap_indent(max(_h_x0 - _h_lm, 0.0), indent_levels))
             elif alignment == WD_ALIGN_PARAGRAPH.RIGHT and _h_x0 > pw * 0.42:
-                _h_indent_in = max((_h_x0 - _h_lm) / 72, 0.0)
-                para.paragraph_format.left_indent = Pt(_h_indent_in * 72)
+                para.paragraph_format.left_indent = Pt(
+                    snap_indent(max(_h_x0 - _h_lm, 0.0), indent_levels))
             else:
                 para.paragraph_format.left_indent = Pt(0)
             # Заголовок "тип документа + подзаголовок/адрес" : Docling склеивает в один
@@ -2742,7 +2788,9 @@ def build_docx(
             num_match  = _NUM_ITEM_RE.match(text)
             # Подпункт: явный дефис/буллет в начале (любой регистр далее) ИЛИ
             # строчная первая буква (продолжение-перечисление).
-            _dash_sub  = bool(re.match(r'^\s*[-–—•·]\s+', text))
+            # \s* (не \s+): на сканах дефис приклеен к слову («-задолженность»)
+            # — иначе он не срезался и к нему добавлялся второй: «- -задолженность».
+            _dash_sub  = bool(re.match(r'^\s*[-–—•·]\s*[^\W\d]', text))
             is_sub_item = (not num_match) and (
                 _dash_sub or (bool(_li_alpha) and _li_alpha[0].islower()))
 
@@ -2774,8 +2822,10 @@ def build_docx(
                 para.paragraph_format.widow_control = False
                 para.paragraph_format.left_indent        = Pt(0)
                 para.paragraph_format.first_line_indent  = Pt(35.4)
-                # Убираем уже имеющийся дефис/буллет, чтобы не задвоить
-                _sub_body = re.sub(r'^\s*[-–—•·]\s+', '', text)
+                # Убираем уже имеющийся дефис/буллет, чтобы не задвоить.
+                # Пробел после дефиса опционален («-задолженность» на сканах),
+                # но дефис перед цифрой не трогаем (минус числа — не буллет).
+                _sub_body = re.sub(r'^\s*[-–—•·]\s*(?=[^\W\d])', '', text)
                 run           = para.add_run("- " + _sub_body)
                 run.font.name = FONT_NAME
                 run.font.size = Pt(font_pt)

@@ -53,6 +53,10 @@ def reading_order_key(item_level: tuple, pdf_native: bool) -> tuple:
     """
     Ключ сортировки для порядка чтения: страница ↑, сверху вниз, слева направо.
     Y квантуется в бины по 40 pt — items на одной строке сортируются по X.
+
+    УСТАРЕВШЕЕ: бин 40pt покрывает 2-3 строки текста, из-за чего блоки соседних
+    строк сортировались по X (свап строк, перемешивание слов на фрагментированных
+    сканах). Используйте sort_reading_order() — построчную кластеризацию.
     """
     item, _ = item_level
     prov = (getattr(item, "prov", None) or [None])[0]
@@ -66,3 +70,65 @@ def reading_order_key(item_level: tuple, pdf_native: bool) -> tuple:
     x0  = bbox_x0(bx)
     y_bin = round((-mid if pdf_native else mid) / 40) * 40
     return (pg, y_bin, x0)
+
+
+def sort_reading_order(items: list, pdf_native: bool) -> list:
+    """Порядок чтения: страница ↑, строки сверху вниз, внутри строки — слева направо.
+
+    Заменяет квантование Y в фиксированные бины (reading_order_key): фикс-бин
+    либо слишком крупный (несколько строк сортируются по X — свап строк и
+    перемешивание слов), либо режет одну строку по границе бина. Здесь «строка»
+    строится кластеризацией: блок присоединяется к текущей строке, если его
+    bbox перекрывается с ней по вертикали не меньше чем на 50% меньшей из высот.
+    Блоки разных строк текста не перекрываются вовсе (межстрочный зазор), поэтому
+    порог устойчив и к шуму OCR-сегментации, и к блокам разной высоты.
+    """
+    def _geo(item_level):
+        item, _ = item_level
+        prov = (getattr(item, "prov", None) or [None])[0]
+        if prov is None:
+            return None
+        bx = getattr(prov, "bbox", None)
+        if bx is None:
+            return None
+        pg = int(getattr(prov, "page_no", 9999))
+        t = float(getattr(bx, "t", 0))
+        b = float(getattr(bx, "b", 0))
+        # Экранные координаты: top < bottom, y растёт вниз
+        top, bot = (-max(t, b), -min(t, b)) if pdf_native else (min(t, b), max(t, b))
+        return (pg, top, bot, bbox_x0(bx))
+
+    keyed: list[tuple[tuple, int, tuple]] = []
+    for i, il in enumerate(items):
+        g = _geo(il)
+        if g is None:
+            g = (9999, float("inf"), float("inf"), 0.0)
+        keyed.append((g, i, il))
+    # Первичный порядок: страница, верхний край; исходный индекс — стабильность
+    keyed.sort(key=lambda k: (k[0][0], k[0][1], k[1]))
+
+    result: list = []
+    line: list = []                    # блоки текущей визуальной строки
+    line_pg: int = -1
+    line_top = line_bot = 0.0
+
+    def _flush() -> None:
+        line.sort(key=lambda k: (k[0][3], k[1]))    # в строке — слева направо
+        result.extend(k[2] for k in line)
+        line.clear()
+
+    for k in keyed:
+        (pg, top, bot, _x0), _idx, _il = k
+        if line:
+            overlap = min(line_bot, bot) - max(line_top, top)
+            min_h   = max(min(line_bot - line_top, bot - top), 1e-6)
+            if pg == line_pg and overlap >= 0.5 * min_h:
+                line.append(k)
+                line_top = min(line_top, top)
+                line_bot = max(line_bot, bot)
+                continue
+            _flush()
+        line.append(k)
+        line_pg, line_top, line_bot = pg, top, bot
+    _flush()
+    return result

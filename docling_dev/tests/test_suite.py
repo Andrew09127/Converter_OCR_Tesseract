@@ -3,6 +3,7 @@ test_suite.py — полный набор unit-тестов для пакета 
 Запуск: python -m pytest docling_dev/tests/ -v
 """
 from __future__ import annotations
+import re
 import sys
 import types
 from pathlib import Path
@@ -810,3 +811,192 @@ def test_preprocess_no_crash_on_rotated():
         borderValue=(255, 255, 255))
     out = preprocess_for_ocr(rot)
     assert out.shape == (150, 300, 3)
+
+
+#  PAGE ANALYSER — уровни отступов и модель колонок
+
+from docling_dev.page_analyser import (
+    analyse_pages as analyse_page_infos,
+    build_indent_levels, snap_indent, _detect_columns,
+)
+
+
+def _make_body_item(x0, x1, t, b, page=1, label="text"):
+    """Мини-имитация Docling body-элемента с bbox и prov."""
+    bbox = types.SimpleNamespace(l=x0, r=x1, t=t, b=b)
+    prov = types.SimpleNamespace(bbox=bbox, page_no=page, page_w=595.0, page_h=842.0)
+    return (types.SimpleNamespace(label=label, prov=[prov], text="x" * 50), 0)
+
+
+def test_indent_levels_merge_ocr_jitter():
+    """Дрожащие x0 одного отступа (шум OCR 1-4pt) сливаются в ОДИН уровень."""
+    items = [_make_body_item(x0, 500, 700 - i * 20, 690 - i * 20)
+             for i, x0 in enumerate([70, 71.5, 73, 72, 106, 107.5])]
+    levels = build_indent_levels(items, {1: 70.0})
+    # два уровня: ~0-3pt (шум левого поля, отбрасывается порогом 2pt частично)
+    # и ~36-37pt (красная строка). Проверяем что близкие значения не размножились.
+    assert len(levels) <= 2
+    assert any(abs(lv - 36.5) <= 2 for lv in levels)
+
+
+def test_indent_levels_keep_distinct():
+    """Далёкие отступы (красная строка 35pt vs колонка 150pt) — РАЗНЫЕ уровни."""
+    items = ([_make_body_item(105, 500, 700 - i * 20, 690 - i * 20) for i in range(3)]
+             + [_make_body_item(220, 500, 400 - i * 20, 390 - i * 20) for i in range(3)])
+    levels = build_indent_levels(items, {1: 70.0})
+    assert len(levels) == 2
+    assert any(abs(lv - 35) <= 2 for lv in levels)
+    assert any(abs(lv - 150) <= 2 for lv in levels)
+
+
+def test_indent_singleton_no_level():
+    """Одиночный выброс (min_support=2) уровня не образует."""
+    items = ([_make_body_item(105, 500, 700 - i * 20, 690 - i * 20) for i in range(3)]
+             + [_make_body_item(300, 500, 100, 90)])
+    levels = build_indent_levels(items, {1: 70.0})
+    assert len(levels) == 1
+
+
+def test_snap_indent_pulls_to_level():
+    """Сырой отступ в пределах допуска прищёлкивается к уровню."""
+    assert snap_indent(33.0, [35.4, 150.0]) == 35.4
+    assert snap_indent(154.0, [35.4, 150.0]) == 150.0
+
+
+def test_snap_indent_noise_is_zero():
+    """Отступ < 4pt — шум сегментации, отступа нет."""
+    assert snap_indent(3.0, [35.4]) == 0.0
+    assert snap_indent(0.0, []) == 0.0
+
+
+def test_snap_indent_far_raw_kept():
+    """Отступ дальше допуска от всех уровней остаётся сырым."""
+    assert snap_indent(80.0, [35.4, 150.0]) == 80.0
+    assert snap_indent(80.0, []) == 80.0
+
+
+def test_detect_columns_two_column_header():
+    """Шапка заявления: левая колонка x0≈70, правая x0≈300 → 2 колонки."""
+    x0s = [70, 72, 71, 74, 70, 300, 302, 305, 301, 300]
+    cols = _detect_columns(x0s, 595.0)
+    assert len(cols) == 2
+    assert cols[0].x0 < 100 and cols[1].x0 > 250
+
+
+def test_detect_columns_single_column():
+    """Обычная страница: все x0 у левого поля → колонки не детектируются."""
+    x0s = [70, 71, 74, 105, 72, 70, 73, 71]
+    cols = _detect_columns(x0s, 595.0)
+    assert len(cols) < 2
+
+
+def test_page_info_multicolumn_wiring():
+    """analyse_pages: двухколоночная страница получает page_type=multicolumn
+    и column_for_x правильно относит блок к правой колонке."""
+    items = ([_make_body_item(70, 260, 700 - i * 20, 690 - i * 20) for i in range(5)]
+             + [_make_body_item(300, 520, 700 - i * 20, 690 - i * 20) for i in range(5)])
+    infos = analyse_page_infos(items)
+    info = infos[1]
+    assert info.is_multicolumn
+    assert info.column_for_x(300) == 1
+    assert info.column_for_x(70) == 0
+
+
+#  GEOMETRY — sort_reading_order (построчная кластеризация вместо бинов 40pt)
+
+from docling_dev.geometry import sort_reading_order
+
+
+def _line_frag(x0, x1, top, h=12.0, page=1, text="w"):
+    """Фрагмент строки в screen-координатах (t < b, y растёт вниз)."""
+    bbox = types.SimpleNamespace(l=x0, r=x1, t=top, b=top + h)
+    prov = types.SimpleNamespace(bbox=bbox, page_no=page, page_w=595.0, page_h=842.0)
+    return (types.SimpleNamespace(label="text", prov=[prov], text=text), 0)
+
+
+def test_sort_no_line_interleave():
+    """Три строки с шагом 14pt, каждая порезана на фрагменты: порядок строк
+    сохраняется, фрагменты НЕ перемешиваются по X между строками.
+    (Бин 40pt клал все три строки в один бин → интерливинг слов.)"""
+    items = [
+        _line_frag(70, 200, 100, text="во вторую очередь"),
+        _line_frag(210, 400, 100, text="3 131 130,79 руб."),
+        _line_frag(70, 250, 114, text="в третью очередь"),
+        _line_frag(260, 450, 114, text="4 270 589,08 руб."),
+        _line_frag(70, 180, 128, text="2 118 547,65 руб."),
+        _line_frag(190, 380, 128, text="штрафы 105 555,43"),
+    ]
+    # Перемешиваем вход
+    shuffled = [items[4], items[1], items[5], items[0], items[3], items[2]]
+    out = sort_reading_order(shuffled, pdf_native=False)
+    texts = [it.text for it, _ in out]
+    assert texts == ["во вторую очередь", "3 131 130,79 руб.",
+                     "в третью очередь", "4 270 589,08 руб.",
+                     "2 118 547,65 руб.", "штрафы 105 555,43"]
+
+
+def test_sort_full_lines_keep_order():
+    """Однострочные полноширинные блоки с шагом 14pt не свапаются.
+    (Бин 40pt сортировал их по X → пункты списка менялись местами.)"""
+    items = [
+        _line_frag(75, 500, 100, text="- задолженность по кредиту"),
+        _line_frag(70, 510, 114, text="- задолженность по процентам"),
+        _line_frag(72, 505, 128, text="- задолженность по пени"),
+    ]
+    out = sort_reading_order(list(items), pdf_native=False)
+    texts = [it.text for it, _ in out]
+    assert texts == ["- задолженность по кредиту",
+                     "- задолженность по процентам",
+                     "- задолженность по пени"]
+
+
+def test_sort_same_line_left_to_right():
+    """Блоки одной визуальной строки идут слева направо."""
+    items = [
+        _line_frag(300, 500, 100, text="право"),
+        _line_frag(70, 250, 102, text="лево"),
+    ]
+    out = sort_reading_order(list(items), pdf_native=False)
+    assert [it.text for it, _ in out] == ["лево", "право"]
+
+
+def test_sort_pdf_native_coords():
+    """pdf_native (y растёт вверх, t > b): верхняя строка первой."""
+    def native(x0, x1, bottom, h=12.0, text="w"):
+        bbox = types.SimpleNamespace(l=x0, r=x1, t=bottom + h, b=bottom)
+        prov = types.SimpleNamespace(bbox=bbox, page_no=1, page_w=595.0, page_h=842.0)
+        return (types.SimpleNamespace(label="text", prov=[prov], text=text), 0)
+    items = [
+        native(70, 500, 700, text="нижняя"),
+        native(70, 500, 760, text="верхняя"),
+    ]
+    out = sort_reading_order(list(items), pdf_native=True)
+    assert [it.text for it, _ in out] == ["верхняя", "нижняя"]
+
+
+def test_sort_pages_and_no_prov():
+    """Страницы по возрастанию; элементы без prov — в конец."""
+    no_prov = (types.SimpleNamespace(label="text", prov=[], text="без prov"), 0)
+    items = [
+        _line_frag(70, 500, 100, page=2, text="стр2"),
+        no_prov,
+        _line_frag(70, 500, 100, page=1, text="стр1"),
+    ]
+    out = sort_reading_order(items, pdf_native=False)
+    assert [it.text for it, _ in out] == ["стр1", "стр2", "без prov"]
+
+
+#  CONVERTER — расклейка дефиса подпунктов («-задолженность» без пробела)
+
+def test_dash_strip_glued():
+    """Дефис, приклеенный к слову, срезается (не задваивается рендером)."""
+    pat = re.compile(r'^\s*[-–—•·]\s*(?=[^\W\d])')
+    assert pat.sub('', "-задолженность по уплате") == "задолженность по уплате"
+    assert pat.sub('', "- задолженность по уплате") == "задолженность по уплате"
+    assert pat.sub('', "–в третью очередь") == "в третью очередь"
+
+
+def test_dash_negative_number_kept():
+    """Дефис перед цифрой — минус числа, не буллет: не срезается."""
+    pat = re.compile(r'^\s*[-–—•·]\s*(?=[^\W\d])')
+    assert pat.sub('', "-5 000 руб.") == "-5 000 руб."

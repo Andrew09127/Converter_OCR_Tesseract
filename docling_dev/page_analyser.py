@@ -53,7 +53,14 @@ class PageInfo:
         return self.page_type == PAGE_IMAGE
 
     def column_for_x(self, x: float) -> int:
-        """Возвращает индекс колонки для координаты x. -1 если не найдено."""
+        """Возвращает индекс колонки для координаты x. -1 если колонок нет.
+
+        Сначала строгое попадание в [x0, x1): допуск ±10pt в contains()
+        перекрывает границы соседних колонок, и блок на левом краю правой
+        колонки ошибочно приписывался левой."""
+        for i, col in enumerate(self.columns):
+            if col.x0 <= x < col.x1:
+                return i
         for i, col in enumerate(self.columns):
             if col.contains(x):
                 return i
@@ -61,7 +68,7 @@ class PageInfo:
         if self.columns:
             return min(range(len(self.columns)),
                        key=lambda i: abs(self.columns[i].cx - x))
-        return 0
+        return -1
 
 
 _BODY_LABELS = frozenset({"paragraph", "text", "list_item"})
@@ -172,6 +179,83 @@ def analyse_pages(items: list) -> dict[int, PageInfo]:
         result[page] = info
 
     return result
+
+
+# ── Кластеризация левых отступов документа ──────────────────────────────────
+#
+# OCR даёт «дрожащие» x0: соседние абзацы одного и того же отступа отличаются
+# на 1-4 pt, и если переносить сырой x0 в left_indent, вертикали текста
+# расползаются. В реальном документе уровней отступа мало (левое поле, красная
+# строка, правая колонка шапки, глубокий сдвиг реквизитов) — собираем все
+# отступы body-блоков, сливаем близкие значения в уровни и «прищёлкиваем»
+# каждый блок к медиане своего уровня.
+
+# Разрыв между уровнями: соседние отсортированные отступы с зазором <= GAP
+# считаются одним уровнем (шум OCR), больше — разными уровнями.
+_INDENT_GAP_PT = 5.0
+# Прищёлкивание: сырой отступ притягивается к уровню не дальше TOL.
+_INDENT_TOL_PT = 8.0
+
+
+def build_indent_levels(
+    items: list,
+    page_left_min: dict[int, float],
+    gap_pt: float = _INDENT_GAP_PT,
+    min_support: int = 2,
+) -> list[float]:
+    """Уровни левых отступов документа (pt, относительно левого поля страницы).
+
+    Кластеризация 1-D: сортируем отступы body-блоков, режем на группы по
+    зазору > gap_pt, берём медиану групп с поддержкой >= min_support блоков.
+    Одиночные выбросы уровня не образуют — их отступ останется сырым.
+    """
+    raws: list[float] = []
+    for item, _ in items:
+        raw_lbl = getattr(item, "label", None)
+        if raw_lbl is None:
+            continue
+        label = (raw_lbl.value if hasattr(raw_lbl, "value") else str(raw_lbl)).lower()
+        if label not in _BODY_LABELS:
+            continue
+        prov_list = getattr(item, "prov", None) or []
+        if not prov_list:
+            continue
+        bbox = getattr(prov_list[0], "bbox", None)
+        if bbox is None:
+            continue
+        page   = int(getattr(prov_list[0], "page_no", 1))
+        indent = bbox_x0(bbox) - page_left_min.get(page, 0.0)
+        if indent >= 2.0:
+            raws.append(indent)
+
+    if not raws:
+        return []
+    raws.sort()
+    clusters: list[list[float]] = [[raws[0]]]
+    for v in raws[1:]:
+        if v - clusters[-1][-1] <= gap_pt:
+            clusters[-1].append(v)
+        else:
+            clusters.append([v])
+    return [statistics.median(c) for c in clusters if len(c) >= min_support]
+
+
+def snap_indent(
+    raw_indent: float,
+    levels: list[float],
+    tol_pt: float = _INDENT_TOL_PT,
+) -> float:
+    """Прищёлкивает сырой отступ к ближайшему уровню документа.
+
+    < 4 pt — шум сегментации, отступа нет (0). Уровень дальше tol_pt —
+    оставляем сырое значение (нестандартный, но реальный сдвиг)."""
+    if raw_indent < 4.0:
+        return 0.0
+    if levels:
+        nearest = min(levels, key=lambda lv: abs(lv - raw_indent))
+        if abs(nearest - raw_indent) <= tol_pt:
+            return nearest
+    return raw_indent
 
 
 def _detect_columns(x0s: list[float], page_width: float) -> list[ColumnBounds]:
