@@ -148,14 +148,33 @@ def remove_stains(gray):
     thin      = max(3.0, 0.08 * mh)          # толщина линии рамки/подчёркивания
     speck_max = max(4.0, (0.09 * mh) ** 2)   # заведомо мельче точки/запятой
 
-    # ── Штампы: рамка + всё внутри неё ──────────────────────────────────────
+    # ── Рамки: штампы и эмблемы ──────────────────────────────────────────────
     # Канцелярские печати («Вх. №…» с рукописными датами) портят и текстовый
-    # слой, и вёрстку. Находим рамки штампов и помечаем на удаление рамку и
-    # компоненты, лежащие внутри неё (>=70% площади bbox). Текст документа,
-    # пересекающий рамку снаружи (строка поверх штампа), остаётся.
+    # слой, и вёрстку — удаляем рамку и всё внутри (>=60% площади в зоне
+    # рамка±mh; текст документа, пересекающий рамку снаружи, остаётся).
+    # Но рамка бывает и у ГЕРБА/эмблемы письма — её содержимое наоборот
+    # ЗАЩИЩАЕМ от остальных правил (иначе орёл сотрётся как «не-текст» и
+    # Tesseract прочитает его бледный след как мусорные буквы).
+    # Штамп: ШИРОКИЙ (w>=1.4h) и без крупной графики внутри.
     stamp_ids: set[int] = set()
+    protect_zones: list[tuple[int, int, int, int]] = []
     frames = _find_stamp_frames(labels, stats, n, mh, W, H)
     for fid, fx, fy, fw, fh in frames:
+        _has_graphic = False
+        for i in range(1, n):
+            if i == fid:
+                continue
+            x = stats[i, cv2.CC_STAT_LEFT];  y = stats[i, cv2.CC_STAT_TOP]
+            w = stats[i, cv2.CC_STAT_WIDTH]; h = stats[i, cv2.CC_STAT_HEIGHT]
+            if (x >= fx and y >= fy and x + w <= fx + fw and y + h <= fy + fh
+                    and float(stats[i, cv2.CC_STAT_AREA]) >= 0.12 * fw * fh):
+                _has_graphic = True
+                break
+        if fw < 1.4 * fh or _has_graphic:
+            protect_zones.append((fx, fy, fw, fh))
+            log.debug("ocr_preprocess: рамка %dx%d — эмблема/герб, содержимое защищено",
+                      fw, fh)
+            continue
         stamp_ids.add(fid)
         # Зону штампа расширяем на высоту строки: подписи штампа выступают
         # чуть за рамку («КАМЕНСКИЙ…» под нижним бортом).
@@ -172,8 +191,15 @@ def remove_stains(gray):
             if ov_w > 0 and ov_h > 0 and ov_w * ov_h >= 0.6 * w * h:
                 stamp_ids.add(i)
     if frames:
-        log.debug("ocr_preprocess: штампов (рамок): %d, компонент внутри: %d",
-                  len(frames), len(stamp_ids) - len(frames))
+        log.debug("ocr_preprocess: рамок: %d (штампы: %d id, эмблемы: %d)",
+                  len(frames), len(stamp_ids), len(protect_zones))
+
+    def _in_protect_zone(x: int, y: int, w: int, h: int) -> bool:
+        for zx, zy, zw, zh in protect_zones:
+            if x >= zx - 2 and y >= zy - 2 and x + w <= zx + zw + 2 \
+                    and y + h <= zy + zh + 2:
+                return True
+        return False
 
     # Из входа построения строк исключаем всё, что заведомо не буквы:
     #   линии разметки — иначе строка, пересекающая рамку штампа, слипается
@@ -253,6 +279,14 @@ def remove_stains(gray):
         if i in stamp_ids:
             remove_ids.append(i)
             continue
+        # Содержимое рамки герба/эмблемы — не трогаем целиком
+        if protect_zones and _in_protect_zone(x, y, w, h):
+            continue
+        # Крупная графика (эмблема без рамки, логотип): большая в обоих
+        # измерениях и с заметной чернильностью — это содержимое документа,
+        # не грязь (грязевые обломки мельче, кляксы ловятся правилом ниже).
+        if w >= 3 * mh and h >= 3 * mh and 0.15 <= density < 0.45:
+            continue
         # Тонкие длинные линии (границы таблиц, подчёркивания) — не трогаем
         if min(w, h) <= thin and max(w, h) >= 3 * mh:
             continue
@@ -274,10 +308,10 @@ def remove_stains(gray):
 
     if not remove_ids:
         return gray
-    # Раздуваем маску удаления на 1px: убираем антиалиасный ореол вокруг
+    # Раздуваем маску удаления на 2px: убираем антиалиасный ореол вокруг
     # пятна (светлее порога Otsu), иначе Tesseract видит бледный «призрак».
     rm_mask = np.isin(labels, np.asarray(remove_ids)).astype(np.uint8)
-    rm_mask = cv2.dilate(rm_mask, np.ones((3, 3), np.uint8))
+    rm_mask = cv2.dilate(rm_mask, np.ones((5, 5), np.uint8))
     cleaned = gray.copy()
     cleaned[rm_mask.astype(bool)] = 255
     log.debug("ocr_preprocess: удалено пятен/точек: %d (median_h=%.0fpx)",
