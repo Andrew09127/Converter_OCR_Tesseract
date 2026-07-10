@@ -83,6 +83,8 @@ def sort_reading_order(items: list, pdf_native: bool) -> list:
     Блоки разных строк текста не перекрываются вовсе (межстрочный зазор), поэтому
     порог устойчив и к шуму OCR-сегментации, и к блокам разной высоты.
     """
+    _PIC_LABELS = ("picture", "figure", "image")
+
     def _geo(item_level):
         item, _ = item_level
         prov = (getattr(item, "prov", None) or [None])[0]
@@ -96,13 +98,16 @@ def sort_reading_order(items: list, pdf_native: bool) -> list:
         b = float(getattr(bx, "b", 0))
         # Экранные координаты: top < bottom, y растёт вниз
         top, bot = (-max(t, b), -min(t, b)) if pdf_native else (min(t, b), max(t, b))
-        return (pg, top, bot, bbox_x0(bx))
+        raw = getattr(item, "label", None)
+        lbl = (raw.value if hasattr(raw, "value") else str(raw or "")).lower()
+        solo = lbl in _PIC_LABELS
+        return (pg, top, bot, bbox_x0(bx), solo)
 
     keyed: list[tuple[tuple, int, tuple]] = []
     for i, il in enumerate(items):
         g = _geo(il)
         if g is None:
-            g = (9999, float("inf"), float("inf"), 0.0)
+            g = (9999, float("inf"), float("inf"), 0.0, False)
         keyed.append((g, i, il))
     # Первичный порядок: страница, верхний край; исходный индекс — стабильность
     keyed.sort(key=lambda k: (k[0][0], k[0][1], k[1]))
@@ -118,7 +123,16 @@ def sort_reading_order(items: list, pdf_native: bool) -> list:
         line.clear()
 
     for k in keyed:
-        (pg, top, bot, _x0), _idx, _il = k
+        (pg, top, bot, _x0, solo) = k[0]
+        # Картинка идёт отдельной «строкой» и не кластеризуется с текстом:
+        # высокая картинка (логотип, пятно на всю высоту абзаца) перекрывает
+        # несколько текстовых строк и, попав в общий ряд, сцепляет их в один —
+        # строки сортируются по X и перемешиваются.
+        if solo:
+            _flush()
+            result.append(k[2])
+            line_pg = -1
+            continue
         if line:
             overlap = min(line_bot, bot) - max(line_top, top)
             min_h   = max(min(line_bot - line_top, bot - top), 1e-6)

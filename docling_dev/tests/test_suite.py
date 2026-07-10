@@ -1138,3 +1138,21 @@ def test_junk_image_solid_logo_kept():
     img = _np.full((200, 200), 255, dtype=_np.uint8)
     _cv2.circle(img, (100, 100), 70, 0, -1)
     assert _is_junk_image(_PILImage.fromarray(img)) is False
+
+
+def test_sort_tall_picture_does_not_chain_lines():
+    """Высокая картинка (пятно/логотип) перекрывает несколько строк по
+    вертикали, но НЕ сцепляет их в один ряд: строки сохраняют порядок по Y."""
+    def _pic(x0, x1, top, h):
+        bbox = types.SimpleNamespace(l=x0, r=x1, t=top, b=top + h)
+        prov = types.SimpleNamespace(bbox=bbox, page_no=1, page_w=595.0, page_h=842.0)
+        return (types.SimpleNamespace(label="picture", prov=[prov], text=""), 0)
+    items = [
+        _pic(40, 70, 98, 60),                                   # пятно на 3 строки
+        _line_frag(430, 560, 100, text="2. ПАО МФК Займер"),
+        _line_frag(360, 560, 116, text="ИНН 5406836941"),
+        _line_frag(280, 560, 132, text="Адрес: 630099"),
+    ]
+    out = sort_reading_order(list(items), pdf_native=False)
+    texts = [it.text for it, _ in out if it.text]
+    assert texts == ["2. ПАО МФК Займер", "ИНН 5406836941", "Адрес: 630099"]

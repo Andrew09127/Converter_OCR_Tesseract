@@ -90,6 +90,7 @@ def analyse_pages(items: list) -> dict[int, PageInfo]:
     lefts_by_page:   dict[int, list[float]] = {}
     rights_by_page:  dict[int, list[float]] = {}
     x0s_by_page:     dict[int, list[float]] = {}
+    x1s_by_page:     dict[int, list[float]] = {}
     table_count:     dict[int, int]         = {}
     text_count:      dict[int, int]         = {}
     page_sizes:      dict[int, tuple[float, float]] = {}
@@ -136,6 +137,7 @@ def analyse_pages(items: list) -> dict[int, PageInfo]:
         if x1 > 0:
             rights_by_page.setdefault(page, []).append(x1)
         x0s_by_page.setdefault(page, []).append(x0)
+        x1s_by_page.setdefault(page, []).append(x1)
 
     # Строим PageInfo для каждой страницы
     all_pages = set(heights_by_page) | set(table_count) | set(text_count)
@@ -167,6 +169,12 @@ def analyse_pages(items: list) -> dict[int, PageInfo]:
             # Детекция колонок по распределению x0
             x0s = x0s_by_page.get(page, [])
             cols = _detect_columns(x0s, pw)
+            if len(cols) >= 2 and _is_right_justified(
+                    x0s, x1s_by_page.get(page, []), cols[1].x0, pw):
+                # Правовыровненная шапка маскируется под колонки: x0 рассыпан
+                # (рваный левый край), а правые края сходятся у правого поля.
+                # Это НЕ колонки — выключка вправо.
+                cols = []
             if len(cols) >= 2:
                 info.page_type = PAGE_MULTICOLUMN
                 info.columns   = cols
@@ -256,6 +264,28 @@ def snap_indent(
         if abs(nearest - raw_indent) <= tol_pt:
             return nearest
     return raw_indent
+
+
+def _is_right_justified(x0s: list[float], x1s: list[float],
+                        col2_x0: float, page_width: float) -> bool:
+    """True если «правая колонка» — на деле правовыровненные строки.
+
+    У настоящей колонки блоки выровнены по ЛЕВОМУ краю (x0 сходятся, правый
+    рваный); у выключки вправо — наоборот: правые края сходятся у правого поля,
+    а x0 рассыпан. Сравниваем разброс (p90-p10) краёв блоков правой зоны."""
+    if len(x0s) != len(x1s) or page_width <= 0:
+        return False
+    pairs = [(a, b) for a, b in zip(x0s, x1s) if a >= col2_x0 - 10 and b > 0]
+    if len(pairs) < 4:
+        return False
+    xs0 = sorted(a for a, _ in pairs)
+    def _spread(v: list[float]) -> float:
+        return v[int(len(v) * 0.9)] - v[int(len(v) * 0.1)]
+    # Большинство блоков дотягивается до правого поля (выключка), при этом
+    # левые края рассыпаны (у настоящей колонки они наоборот выровнены).
+    at_right = sum(1 for _, b in pairs if b >= page_width * 0.88)
+    return (at_right >= 0.55 * len(pairs)
+            and _spread(xs0) >= page_width * 0.15)
 
 
 def _detect_columns(x0s: list[float], page_width: float) -> list[ColumnBounds]:

@@ -2073,7 +2073,10 @@ def build_docx(
             continue
         _lpw, _lph = page_sizes.get(_lpg, (595.0, 842.0))
         _ll = float(getattr(_lbb, "l", 0)); _lr = float(getattr(_lbb, "r", 0))
-        if not (_ll < _lpw * 0.50 and _lr < _lpw * 0.55):
+        # До 0.75/0.85 ширины: метки правовыровненных строк («Адрес:» в шапке
+        # заявления, x0≈0.55-0.65pw) тоже пары — решение «склеить в строку или
+        # таблица» принимает зазор в рендере.
+        if not (_ll < _lpw * 0.75 and _lr < _lpw * 0.85):
             continue
         _ltop = max(float(getattr(_lbb, "t", 0)), float(getattr(_lbb, "b", 0)))
         # значение ищем СРЕДИ ПРЕДШЕСТВУЮЩИХ блоков (тех, что inline-поиск не видит)
@@ -2393,6 +2396,13 @@ def build_docx(
                 and not re.search(r"[A-Za-zА-Яа-яЁё0-9]", text):
             log.info("[стр%d] пропуск шум-блока (нет букв/цифр): %r", page_no, text[:20])
             continue
+        # Микро-блок: 1-2 символа в bbox высотой < 4pt («ы» из обрывка пятна).
+        # Настоящий текст такого размера в юр-документах не встречается.
+        if lbl in ("text", "paragraph") and bbox is not None \
+                and bbox_h(bbox) < 4.0 and len(text) <= 2:
+            log.info("[стр%d] пропуск микро-блока (h=%.1fpt): %r",
+                     page_no, bbox_h(bbox), text)
+            continue
 
         # Логируем значимые исправления OCR (изменение >= 3 символов или 5% текста)
         if raw_text != text:
@@ -2475,16 +2485,29 @@ def build_docx(
             elif (alignment == WD_ALIGN_PARAGRAPH.LEFT
                   and len(text) > 80 and indent_pt < 10.0):
                 alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            # Строка, прижатая к ПРАВОМУ краю (r≈правое поле, не на всю ширину,
+            # начало заметно правее левого поля), — правовыровненная строка
+            # шапки заявления. Колоночный текст сюда не попадает: он либо в
+            # ветке колонок выше, либо уже стал LEFT по правилу len>60.
+            elif (alignment == WD_ALIGN_PARAGRAPH.LEFT
+                  and bw / pw <= 0.75
+                  and float(getattr(bbox, "r", 0)) >= pw * 0.92
+                  and raw_x0 >= pw * 0.25):
+                alignment = WD_ALIGN_PARAGRAPH.RIGHT
             # Короткая строка в ПРАВОЙ КОЛОНКЕ, которую detect_alignment принял
             # за CENTER/RIGHT — на деле левовыключенная строка колонки-шапки заявления.
             # Возвращаем LEFT, чтобы применился отступ колонки и строка встала в
-            # один край с длинными соседями того же блока.
+            # один край с длинными соседями того же блока. НЕ трогаем строки,
+            # реально прижатые к правому полю (r>=0.92pw) — они правовыровнены.
+            _bbox_r = float(getattr(bbox, "r", 0))
             if (alignment in (WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.RIGHT)
-                    and indent_pt > pw * 0.18):
+                    and indent_pt > pw * 0.18 and _bbox_r < pw * 0.92):
                 alignment = WD_ALIGN_PARAGRAPH.LEFT
             # Реквизитные строки (Р/с, ИНН, КПП, Кор/сч, БИК, Получатель, ОГРН) —
-            # всегда LEFT (маркированные данные). Применяем последним как override.
-            if _REQ_LABEL_RE.match(text):
+            # LEFT (маркированные данные), кроме прижатых к правому полю строк
+            # правовыровненной шапки. Применяем последним как override.
+            if _REQ_LABEL_RE.match(text) and not (
+                    _bbox_r >= pw * 0.92 and bw / pw <= 0.75):
                 alignment = WD_ALIGN_PARAGRAPH.LEFT
 
         # Жирный/курсив: Docling formatting (нативные PDF) - приоритет; для сканов
@@ -2564,8 +2587,8 @@ def build_docx(
         _cp_value_idx = _coplanar_back.get(idx)
         if _cp_value_idx is None and (lbl in ("text", "paragraph") and bbox is not None
                 and text.rstrip().endswith(":")
-                and float(getattr(bbox, "l", 0)) < pw * 0.50
-                and float(getattr(bbox, "r", pw)) < pw * 0.55):
+                and float(getattr(bbox, "l", 0)) < pw * 0.75
+                and float(getattr(bbox, "r", pw)) < pw * 0.85):
             _label_right = float(getattr(bbox, "r", 0))
             # Верх метки: в pdf_native t>b, поэтому берём max(t,b)
             _label_top = max(float(getattr(bbox, "t", 0)), float(getattr(bbox, "b", 0)))
@@ -2602,24 +2625,55 @@ def build_docx(
                 _cj_text = postprocess((getattr(_cj_item, "text", None) or "").strip())
                 if _cj_text:
                     _full_tw = (pw - 2 * MARGIN_INCH * 72) / 72
-                    _cp_x0   = float(getattr(
-                        getattr((getattr(_cj_item, "prov", None) or [None])[0], "bbox", None) or type("", (), {"l": pw * 0.45})(),
-                        "l", pw * 0.45))
-                    _cp_col  = max((_cp_x0 - MARGIN_INCH * 72) / 72, 0.5)
-                    _cp_ratio = min(_cp_col / _full_tw, 0.65)
-                    _cp_label_bold = bool([c for c in text if c.isalpha()])
-                    add_label_content_table(
-                        doc,
-                        text.rstrip(":").rstrip() + ":",
-                        [{"text": _cj_text, "font_pt": BODY_PT, "bold": False, "italic": False}],
-                        _full_tw,
-                        space_before,
-                        indent_inch=0.0,
-                        col_ratio=_cp_ratio,
-                    )
+                    _cj_bbox = getattr(
+                        (getattr(_cj_item, "prov", None) or [None])[0], "bbox", None)
+                    _cp_x0 = (float(getattr(_cj_bbox, "l", pw * 0.45))
+                              if _cj_bbox is not None else pw * 0.45)
+                    _cp_r  = (float(getattr(_cj_bbox, "r", pw))
+                              if _cj_bbox is not None else pw)
+                    _label_r = float(getattr(bbox, "r", 0)) if bbox is not None else 0.0
+                    _gap = _cp_x0 - _label_r
+                    if _gap <= 8.0:
+                        # Зазор в одну пробельную ширину — Tesseract разрезал ОДНУ
+                        # строку («Адрес: 344002, …») на два блока. Склеиваем в один
+                        # абзац; выравнивание — по объединённому bbox: строка,
+                        # прижатая к правому краю, остаётся правовыровненной.
+                        _u_l = float(getattr(bbox, "l", 0)) if bbox is not None else 0.0
+                        _u_ratio = (_cp_r - _u_l) / pw if pw > 0 else 1.0
+                        if _cp_r >= pw * 0.90 and _u_ratio <= 0.80:
+                            _cp_align = WD_ALIGN_PARAGRAPH.RIGHT
+                        elif _u_ratio > 0.75:
+                            _cp_align = WD_ALIGN_PARAGRAPH.JUSTIFY
+                        else:
+                            _cp_align = WD_ALIGN_PARAGRAPH.LEFT
+                        para = doc.add_paragraph()
+                        para.alignment                      = _cp_align
+                        para.paragraph_format.space_before  = Pt(space_before)
+                        para.paragraph_format.space_after   = Pt(0)
+                        para.paragraph_format.widow_control = False
+                        run = para.add_run(f"{text} {_cj_text}")
+                        run.font.name = FONT_NAME
+                        run.font.size = Pt(BODY_PT)
+                        log.info("[стр%d] coplanar-строка (gap=%.1fpt, %s): %r + %r",
+                                 page_no, _gap,
+                                 _align_names.get(_cp_align, "?"),
+                                 text[:30], _cj_text[:40])
+                    else:
+                        _cp_col  = max((_cp_x0 - MARGIN_INCH * 72) / 72, 0.5)
+                        _cp_ratio = min(_cp_col / _full_tw, 0.65)
+                        add_label_content_table(
+                            doc,
+                            text.rstrip(":").rstrip() + ":",
+                            [{"text": _cj_text, "font_pt": BODY_PT, "bold": False, "italic": False}],
+                            _full_tw,
+                            space_before,
+                            indent_inch=0.0,
+                            col_ratio=_cp_ratio,
+                        )
+                        log.info("[стр%d] coplanar-pair: %r → %r",
+                                 page_no, text[:40], _cj_text[:40])
                     skip_indices.add(_cp_value_idx)
                     _coplanar_rendered = True
-                    log.info("[стр%d] coplanar-pair: %r → %r", page_no, text[:40], _cj_text[:40])
         if _coplanar_rendered:
             continue
 
@@ -2632,6 +2686,15 @@ def build_docx(
         lc = (split_label_content(text)
               if (_item_x0 <= pw * LABEL_MARGIN_THRESHOLD or _is_side_label)
               else None)
+        # Одиночная правовыровненная строка с инлайн-значением («Адрес: 630055,
+        # г. Новосибирск…» одним блоком в правой зоне) — это просто строка
+        # оригинала, а не колонка «метка: содержимое». Рендерим обычным абзацем.
+        if (lc is not None and lc[1] and bbox is not None
+                and float(getattr(bbox, "r", 0)) >= pw * 0.85
+                and _item_x0 >= pw * 0.30):
+            log.info("[стр%d] label-строка правой зоны → обычный абзац: %r",
+                     page_no, text[:50])
+            lc = None
         if lc is not None:
             _full_tw      = (pw - 2 * MARGIN_INCH * 72) / 72
             _lc_indent    = 0.0
