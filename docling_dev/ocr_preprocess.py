@@ -148,6 +148,34 @@ def remove_stains(gray):
     thin      = max(3.0, 0.08 * mh)          # толщина линии рамки/подчёркивания
     speck_max = max(4.0, (0.09 * mh) ** 2)   # заведомо мельче точки/запятой
 
+    # Сетка таблицы: все линии соединены в ОДНУ огромную тонкоштриховую
+    # компоненту (bbox не «тонкий», правило линий её не ловит). Решётку
+    # защищаем и исключаем из построения строк — иначе она склеивает весь
+    # текст таблицы в мегаблоб, строки внутри ячеек не образуются и текст
+    # ячеек уничтожается правилом «вне строк».
+    def _is_lattice(w: float, h: float, density: float) -> bool:
+        return min(w, h) >= 8 * mh and density <= 0.12
+
+    lattice_ids: set[int] = set()
+    lattice_zones: list[tuple[int, int, int, int]] = []
+    for i in range(1, n):
+        w, h = ws[i - 1], hs[i - 1]
+        d = float(stats[i, cv2.CC_STAT_AREA]) / max(w * h, 1.0)
+        if _is_lattice(w, h, d):
+            lattice_ids.add(i)
+            lattice_zones.append((stats[i, cv2.CC_STAT_LEFT],
+                                  stats[i, cv2.CC_STAT_TOP], int(w), int(h)))
+
+    def _in_lattice_zone(x: int, y: int, w: int, h: int) -> bool:
+        """Компонента внутри bbox сетки таблицы: содержимое ячеек не трогаем —
+        JUSTIFY внутри узких ячеек растягивает пробелы так, что короткие
+        токены («от», «7») выпадают из строк и спасательного зазора."""
+        for zx, zy, zw, zh in lattice_zones:
+            if x >= zx - 2 and y >= zy - 2 and x + w <= zx + zw + 2 \
+                    and y + h <= zy + zh + 2:
+                return True
+        return False
+
     # ── Рамки: штампы и эмблемы ──────────────────────────────────────────────
     # Канцелярские печати («Вх. №…» с рукописными датами) портят и текстовый
     # слой, и вёрстку — удаляем рамку и всё внутри (>=60% площади в зоне
@@ -207,9 +235,9 @@ def remove_stains(gray):
     #   специ и кромки — точки-«дорожки» и тени сканера сцепляют соседние
     #     строки диагонально в блоб-«змею» через всю страницу, которая
     #     поглощает случайные буквы и лишает их своей строки.
-    drop_ids = list(stamp_ids)
+    drop_ids = list(stamp_ids | lattice_ids)
     for i in range(1, n):
-        if i in stamp_ids:
+        if i in stamp_ids or i in lattice_ids:
             continue
         w, h = ws[i - 1], hs[i - 1]
         area = float(stats[i, cv2.CC_STAT_AREA])
@@ -278,6 +306,11 @@ def remove_stains(gray):
         # стороны рамки сами похожи на линии разметки.
         if i in stamp_ids:
             remove_ids.append(i)
+            continue
+        # Сетка таблицы и всё внутри неё — разметка и текст ячеек, не трогаем
+        if i in lattice_ids:
+            continue
+        if lattice_zones and _in_lattice_zone(x, y, w, h):
             continue
         # Содержимое рамки герба/эмблемы — не трогаем целиком
         if protect_zones and _in_protect_zone(x, y, w, h):

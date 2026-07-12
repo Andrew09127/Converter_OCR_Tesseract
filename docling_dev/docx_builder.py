@@ -190,33 +190,105 @@ def add_table_from_grid(doc: Document, grid: list) -> None:
     doc.add_paragraph()
 
 
-def add_table_from_cells(doc: Document, table_item) -> None:
+def _table_col_widths_inch(data, n_cols: int, text_w_inch: float) -> list[float] | None:
+    """Ширины колонок из bbox ячеек TableFormer, отмасштабированные на ширину
+    текстовой зоны. None если у ячеек нет пригодных координат."""
+    starts: dict[int, list[float]] = {}
+    right = 0.0
+    for cell in getattr(data, "table_cells", []) or []:
+        bb = getattr(cell, "bbox", None)
+        if bb is None:
+            continue
+        c0 = int(getattr(cell, "start_col_offset_idx", 0))
+        l  = float(getattr(bb, "l", 0.0))
+        r  = float(getattr(bb, "r", 0.0))
+        starts.setdefault(c0, []).append(l)
+        right = max(right, r)
+    if len(starts) < n_cols or right <= 0:
+        return None
+    xs = []
+    for c in range(n_cols):
+        vals = sorted(starts.get(c, []))
+        if not vals:
+            return None
+        xs.append(vals[len(vals) // 2])
+    if any(b <= a for a, b in zip(xs, xs[1:])) or right <= xs[-1]:
+        return None
+    bounds = xs + [right]
+    widths_pt = [bounds[i + 1] - bounds[i] for i in range(n_cols)]
+    total = sum(widths_pt)
+    if total <= 0:
+        return None
+    return [w / total * text_w_inch for w in widths_pt]
+
+
+def add_table_from_cells(doc: Document, table_item,
+                         text_w_inch: float | None = None) -> None:
+    """Таблица из TableFormer-ячеек: с объединёнными ячейками (span'ы) и
+    ширинами колонок из координат. Раньше span'ы игнорировались (писался
+    только start-offset) — сетка «съезжала», Word давил колонки поровну."""
     data   = table_item.data
     n_rows = getattr(data, "num_rows", 0)
     n_cols = getattr(data, "num_cols", 0)
     if n_rows == 0 or n_cols == 0:
         return
-    grid: list[list[str]] = [[""] * n_cols for _ in range(n_rows)]
-    for cell in getattr(data, "table_cells", []):
-        r = getattr(cell, "start_row_offset_idx", 0)
-        c = getattr(cell, "start_col_offset_idx", 0)
-        if 0 <= r < n_rows and 0 <= c < n_cols:
-            grid[r][c] = postprocess(getattr(cell, "text", "") or "")
     tbl       = doc.add_table(rows=n_rows, cols=n_cols)
     tbl.style = "Table Grid"
-    for r_idx, row in enumerate(grid):
-        for c_idx, text in enumerate(row):
-            cell = tbl.rows[r_idx].cells[c_idx]
+
+    # Ширины колонок: фиксированная раскладка, чтобы Word не пересчитывал
+    widths = (_table_col_widths_inch(data, n_cols, text_w_inch)
+              if text_w_inch else None)
+    if widths:
+        tbl_el = tbl._tbl
+        tbl_pr = tbl_el.find(qn("w:tblPr"))
+        if tbl_pr is None:
+            tbl_pr = OxmlElement("w:tblPr")
+            tbl_el.insert(0, tbl_pr)
+        _layout = OxmlElement("w:tblLayout")
+        _layout.set(qn("w:type"), "fixed")
+        tbl_pr.append(_layout)
+        tbl_grid = tbl_el.find(qn("w:tblGrid"))
+        if tbl_grid is not None:
+            for gc in tbl_grid.findall(qn("w:gridCol")):
+                tbl_grid.remove(gc)
+            for w in widths:
+                gc = OxmlElement("w:gridCol")
+                gc.set(qn("w:w"), str(int(w * 1440)))
+                tbl_grid.append(gc)
+
+    filled: set[tuple[int, int]] = set()
+    for cell in getattr(data, "table_cells", []) or []:
+        r0 = max(int(getattr(cell, "start_row_offset_idx", 0)), 0)
+        c0 = max(int(getattr(cell, "start_col_offset_idx", 0)), 0)
+        r1 = min(int(getattr(cell, "end_row_offset_idx", r0 + 1)), n_rows)
+        c1 = min(int(getattr(cell, "end_col_offset_idx", c0 + 1)), n_cols)
+        if r0 >= n_rows or c0 >= n_cols or r1 <= r0 or c1 <= c0:
+            continue
+        target = tbl.cell(r0, c0)
+        if (r1 - r0 > 1 or c1 - c0 > 1) and (r0, c0) not in filled:
+            try:
+                target = target.merge(tbl.cell(r1 - 1, c1 - 1))
+            except Exception:
+                pass                       # уже слитые/пересекающиеся span'ы
+        for rr in range(r0, r1):
+            for cc in range(c0, c1):
+                filled.add((rr, cc))
+        text = postprocess(getattr(cell, "text", "") or "")
+        if not text:
+            continue
+        for p in target.paragraphs:
+            p.clear()
+        para = target.paragraphs[0]
+        para.paragraph_format.space_before = Pt(0)
+        para.paragraph_format.space_after  = Pt(0)
+        run           = para.add_run(text)
+        run.font.name = FONT_NAME
+        run.font.size = Pt(9.0)
+        run.bold      = bool(getattr(cell, "column_header", False))
+
+    for row in tbl.rows:
+        for cell in row.cells:
             _set_cell_borders(cell)
-            for p in cell.paragraphs:
-                p.clear()
-            para = cell.paragraphs[0]
-            para.paragraph_format.space_before = Pt(0)
-            para.paragraph_format.space_after  = Pt(0)
-            run           = para.add_run(text)
-            run.font.name = FONT_NAME
-            run.font.size = Pt(9.0)
-            run.bold      = (r_idx == 0)
     doc.add_paragraph()
 
 

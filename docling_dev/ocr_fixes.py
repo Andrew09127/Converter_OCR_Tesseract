@@ -512,7 +512,41 @@ _OCR_CHAR_FIXES: list[tuple[re.Pattern, object]] = [
     (re.compile(r'\bобл\s*:\s*(?=\s|,|$)'), 'обл. '),
     # «обл. ,» / «обл ,» с пробелом перед запятой → «обл.,»
     (re.compile(r'\bобл\.?\s+,'), 'обл.,'),
+
+    # ── Латиница после дат и в денежных сокращениях ──────────────────────────
+    # «28.10.2024 r.» / «2024 r.,» — латинская r после года → «г.»
+    (re.compile(r'(\d{4})\s*r\b\.?'), r'\1 г.'),
+    # «py6» → «руб» (латиница вместо кириллицы в сумме)
+    (re.compile(r'\bpy6\b'), 'руб'),
+    # «25 kon.» / «25 коn.» → «25 коп.»
+    (re.compile(r'\b[kк][оo]n\b'), 'коп'),
+    # «25 кон.» после цифры — OCR путает п/н в «коп.»
+    (re.compile(r'(?<=\d )кон\b'), 'коп'),
 ]
+
+# ── Капс-аббревиатуры: латиница-двойник → кириллица ─────────────────────────
+# OCR читает кириллические аббревиатуры латиницей: «KHII» вместо «КНП»,
+# «COB» вместо «СОВ». Двойники однозначны в верхнем регистре.
+_CAPS_LOOKALIKE = str.maketrans("ABCEHKMOPTX", "АВСЕНКМОРТХ")
+
+
+def _fix_caps_token(m: re.Match) -> str:
+    tok = m.group(0)
+    conv = tok.replace("II", "П").translate(_CAPS_LOOKALIKE)
+    # Конвертируем только если результат стал ПОЛНОСТЬЮ кириллическим:
+    # частичная конверсия («BMW» → «ВМW») хуже оригинала.
+    if re.fullmatch(r'[А-ЯЁ]{2,}', conv):
+        return conv
+    return tok
+
+
+# Смешанный токен (есть и кириллица, и латиница): «КНII», «ЗАЯBЛЕНИЕ»
+_MIXED_CAPS_RE = re.compile(
+    r'\b(?=[А-ЯЁA-Z]*[А-ЯЁ])(?=[А-ЯЁA-Z]*[A-Z])[А-ЯЁA-Z]{2,10}\b')
+# Чисто латинский КОРОТКИЙ токен после кириллического слова: «решение KHII о…».
+# Длина <= 4: марки («TOYOTA», «NISSAN») длиннее либо содержат неконвертируемые
+# буквы и остаются как есть.
+_LATIN_CAPS_RE = re.compile(r'(?<=[а-яё] )[A-ZI]{2,4}(?=[\s.,;:)!?»]|$)')
 
 
 def fix_quotes(text: str) -> str:
@@ -545,5 +579,8 @@ def postprocess(text: str) -> str:
     """Применяет все OCR-исправления символов, затем нормализует кавычки."""
     for pattern, repl in _OCR_CHAR_FIXES:
         text = pattern.sub(repl, text)
+    # Капс-аббревиатуры: латиница-двойник → кириллица («KHII» → «КНП»)
+    text = _MIXED_CAPS_RE.sub(_fix_caps_token, text)
+    text = _LATIN_CAPS_RE.sub(_fix_caps_token, text)
     text = _restore_centrinvest_phone(text)
     return fix_quotes(text)

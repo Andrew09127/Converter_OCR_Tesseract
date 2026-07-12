@@ -1761,23 +1761,30 @@ def build_docx(
     _image_pages_rendered: set[int] = set() # страницы уже вставленные как картинки
     skip_indices: set[int] = set()
 
+    _body_len_at_break = 0   # размер body на момент последнего разрыва
+
     def _page_break(target: int, force: bool = False) -> None:
-        nonlocal last_content_page
-        # Разрыв страницы на КАЖДОЙ границе исходной страницы скана (target > текущей):
-        # число страниц и разбивка DOCX совпадают с оригиналом. 
-        # Да, если на странице скана мало текста, внизу
-        # останется пустое место — но это как в оригинале. (Параметр force больше не
-        # влияет на сам факт разрыва; оставлен для совместимости вызовов.)
+        nonlocal last_content_page, _body_len_at_break
+        # Разрыв страницы на границе исходной страницы скана (target > текущей):
+        # число страниц и разбивка DOCX совпадают с оригиналом.
+        # ЗАЩИТА ОТ ПУСТЫХ ЛИСТОВ: если после предыдущего разрыва в документ
+        # не добавилось ни одного элемента (пустая/пропущенная страница скана,
+        # двойной вызов на таблице+границе), второй разрыв не вставляем.
         if last_content_page >= 0 and target > last_content_page:
-            if _last_body_para is not None:
-                from docx.enum.text import WD_BREAK
-                _last_body_para.add_run().add_break(WD_BREAK.PAGE)
+            cur_len = len(doc.element.body)
+            if cur_len > _body_len_at_break:
+                if _last_body_para is not None:
+                    from docx.enum.text import WD_BREAK
+                    _last_body_para.add_run().add_break(WD_BREAK.PAGE)
+                else:
+                    pb = doc.add_page_break()
+                    pb.paragraph_format.space_before  = Pt(0)
+                    pb.paragraph_format.space_after   = Pt(0)
+                    pb.paragraph_format.widow_control = False
+                _body_len_at_break = len(doc.element.body)
             else:
-                pb = doc.add_page_break()
-                pb.paragraph_format.space_before  = Pt(0)
-                pb.paragraph_format.space_after   = Pt(0)
-                pb.paragraph_format.widow_control = False
-        last_content_page = target
+                log.info("[стр%d] пустой лист предотвращён (нет контента "
+                         "после предыдущего разрыва)", target)
         last_content_page = target
 
     # Передаём OCR-блоки первой страницы для дополнения шапки
@@ -2055,6 +2062,14 @@ def build_docx(
     и: метим значение в skip_indices (не рендерить отдельно) +
     запоминаем пару в _coplanar_back, чтобы метка взяла значение из карты.
     """
+    # Метка перед «:» должна ВЫГЛЯДЕТЬ меткой: >=4 букв и заглавная первая.
+    # Иначе обрывок переноса («…, из / них: налог …») считается меткой и
+    # утаскивает своё «значение» из середины предложения.
+    def _labelish(t: str) -> bool:
+        head = t.rstrip().rstrip(":").strip()
+        alpha = [c for c in head if c.isalpha()]
+        return len(alpha) >= 4 and bool(alpha) and alpha[0].isupper()
+
     _coplanar_back: dict[int, int] = {}
     for _li, (_litem, _) in enumerate(all_items):
         if _li in skip_indices:
@@ -2062,7 +2077,7 @@ def build_docx(
         if _label_str(_litem) not in ("text", "paragraph"):
             continue
         _ltext = (getattr(_litem, "text", None) or "").rstrip()
-        if not _ltext.endswith(":"):
+        if not _ltext.endswith(":") or not _labelish(_ltext):
             continue
         _lprov = getattr(_litem, "prov", None) or []
         if not _lprov:
@@ -2275,15 +2290,38 @@ def build_docx(
                 if data is None:
                     log.debug("[стр%d] table: нет data — пропуск", page_no)
                     continue
+                _cells = list(getattr(data, "table_cells", []) or [])
                 nr = getattr(data, "num_rows", len(getattr(data, "grid", [])))
                 nc = getattr(data, "num_cols",
                              max((len(r) for r in getattr(data, "grid", [[]])), default=0))
-                log.info("[стр%d] table: %d строк × %d столбцов", page_no, nr, nc)
+                log.info("[стр%d] table: %d строк × %d столбцов, ячеек %d",
+                         page_no, nr, nc, len(_cells))
+                # «Таблица» 1x1 — ложная сработка детектора на обычном тексте:
+                # рендерим содержимое обычным абзацем, не рамкой.
+                if nr <= 1 and nc <= 1:
+                    _t11 = postprocess(" ".join(
+                        (getattr(c, "text", "") or "").strip() for c in _cells).strip())
+                    if _t11:
+                        _page_break(page_no)
+                        _p11 = doc.add_paragraph()
+                        _p11.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                        _p11.paragraph_format.space_before = Pt(0)
+                        _p11.paragraph_format.space_after  = Pt(0)
+                        _r11 = _p11.add_run(_t11)
+                        _r11.font.name = FONT_NAME
+                        _r11.font.size = Pt(BODY_PT)
+                        _last_body_para = _p11
+                        _last_body_text = _t11
+                        log.info("[стр%d] table 1x1 → абзац: %r", page_no, _t11[:60])
+                    continue
                 _page_break(page_no, force=True)   # таблица на новой стр. скана — сохраняем разрыв
-                if hasattr(data, "grid") and data.grid:
+                _tw_in = (pw - 2 * MARGIN_INCH * 72) / 72
+                # Ячейки TableFormer в приоритете: сохраняют span'ы и ширины.
+                # grid дублирует текст объединённых ячеек в каждую позицию.
+                if _cells and nr > 0:
+                    add_table_from_cells(doc, item, text_w_inch=_tw_in)
+                elif hasattr(data, "grid") and data.grid:
                     add_table_from_grid(doc, data.grid)
-                elif getattr(data, "num_rows", 0) > 0:
-                    add_table_from_cells(doc, item)
             except Exception as exc:
                 log.warning("[стр%d] table: пропущена — %s", page_no, exc)
             continue
@@ -2587,6 +2625,7 @@ def build_docx(
         _cp_value_idx = _coplanar_back.get(idx)
         if _cp_value_idx is None and (lbl in ("text", "paragraph") and bbox is not None
                 and text.rstrip().endswith(":")
+                and _labelish(text)
                 and float(getattr(bbox, "l", 0)) < pw * 0.75
                 and float(getattr(bbox, "r", pw)) < pw * 0.85):
             _label_right = float(getattr(bbox, "r", 0))
