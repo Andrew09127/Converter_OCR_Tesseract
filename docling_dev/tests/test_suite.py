@@ -1178,3 +1178,71 @@ def test_sort_tall_picture_does_not_chain_lines():
 ])
 def test_latin_lookalike_fixes(inp, expected):
     assert postprocess(inp) == expected
+
+
+#  CONVERTER — детект углового штампа (шапка ФНС)
+
+from docling_dev.converter import _detect_corner_letterhead
+
+
+def _zone_entry(x0, x1, top, text, h=12.0):
+    bbox = types.SimpleNamespace(l=x0, r=x1, t=top, b=top + h)
+    return (0, types.SimpleNamespace(text=text), bbox, text)
+
+
+def _bbox_ns(l, r, t=100, b=180):
+    return types.SimpleNamespace(l=l, r=r, t=t, b=b)
+
+
+def test_corner_detected_fns():
+    """ФНС-шапка: герб слева, левый кластер (r<=0.55pw) + правый (x0>=0.45pw)."""
+    pw = 595.0
+    zone = (
+        [_zone_entry(60, 250, 100 + i * 15, f"строка штампа {i}") for i in range(5)]
+        + [_zone_entry(320, 560, 100 + i * 15, f"адресат {i}") for i in range(4)]
+    )
+    res = _detect_corner_letterhead(zone, _bbox_ns(120, 190), pw)
+    assert res is not None
+    left, right = res
+    assert len(left) == 5 and len(right) == 4
+
+
+def test_corner_not_detected_logo_right():
+    """Герб/лого в правой половине — не угловой штамп."""
+    pw = 595.0
+    zone = (
+        [_zone_entry(60, 250, 100 + i * 15, f"л{i}") for i in range(4)]
+        + [_zone_entry(320, 560, 100 + i * 15, f"п{i}") for i in range(4)]
+    )
+    assert _detect_corner_letterhead(zone, _bbox_ns(400, 470), pw) is None
+
+
+def test_corner_not_detected_spanning_block():
+    """Блок через обе половины страницы — не двухколоночная шапка."""
+    pw = 595.0
+    zone = (
+        [_zone_entry(60, 250, 100 + i * 15, f"л{i}") for i in range(4)]
+        + [_zone_entry(320, 560, 100 + i * 15, f"п{i}") for i in range(4)]
+        + [_zone_entry(100, 500, 180, "широкий блок")]
+    )
+    assert _detect_corner_letterhead(zone, _bbox_ns(120, 190), pw) is None
+
+
+def test_corner_not_detected_few_blocks():
+    """Меньше 3 блоков в кластере (лого слева от реквизитов, Центр-инвест) — не corner."""
+    pw = 595.0
+    zone = (
+        [_zone_entry(60, 250, 100, "одна строка")]
+        + [_zone_entry(320, 560, 100 + i * 15, f"п{i}") for i in range(5)]
+    )
+    assert _detect_corner_letterhead(zone, _bbox_ns(120, 190), pw) is None
+
+
+def test_corner_not_detected_ragged_right():
+    """Правый кластер с рваным правым краем (метки/значения ПСБ) — не corner."""
+    pw = 595.0
+    zone = (
+        [_zone_entry(60, 250, 100 + i * 15, f"л{i}") for i in range(4)]
+        + [_zone_entry(320, 400 + i * 20, 100 + i * 15, f"п{i}") for i in range(5)]
+    )
+    assert _detect_corner_letterhead(zone, _bbox_ns(120, 190), pw) is None

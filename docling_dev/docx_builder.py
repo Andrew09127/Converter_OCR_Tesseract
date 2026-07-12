@@ -400,14 +400,42 @@ def add_header_row(
                 para.add_run().add_picture(buf, width=Inches(img_w))
             continue
 
+        # Text-ячейка с картинкой ПЕРВЫМ элементом (герб над строками углового
+        # штампа): картинка центрируется, блоки идут следом.
+        first = True
+        _cell_img = cell_data.get("image")
+        if _cell_img is not None:
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            buf = BytesIO()
+            _cell_img.save(buf, format="PNG")
+            buf.seek(0)
+            img_w = min(float(cell_data.get("image_width_inch", col_w_inch)),
+                        col_w_inch - 0.05)
+            if img_w > 0:
+                para.add_run().add_picture(buf, width=Inches(img_w))
+            first = False
+
         # Tab-stop для label\tcontent блоков: 5cm от левого края ячейки
         _tab_stop_dxa = int(5.0 * 567)  # 5cm в dxa
 
-        first = True
         for block in cell_data.get("blocks", []):
             p = para if first else cell.add_paragraph()
             first = False
-            p.alignment = cell_data.get("alignment", WD_ALIGN_PARAGRAPH.LEFT)
+            # Блок может нести СВОЁ выравнивание и картинку (кроп рукописи)
+            p.alignment = block.get("alignment",
+                                    cell_data.get("alignment", WD_ALIGN_PARAGRAPH.LEFT))
+            _blk_img = block.get("image")
+            if _blk_img is not None:
+                p.paragraph_format.space_before = Pt(block.get("space_before", 0.0))
+                p.paragraph_format.space_after = Pt(0)
+                buf = BytesIO()
+                _blk_img.save(buf, format="PNG")
+                buf.seek(0)
+                _bw = min(float(block.get("image_width_inch", col_w_inch)),
+                          col_w_inch - 0.05)
+                if _bw > 0:
+                    p.add_run().add_picture(buf, width=Inches(_bw))
+                continue
             p.paragraph_format.space_before = Pt(block.get("space_before", 0.0))
             p.paragraph_format.space_after = Pt(0)
             text = block.get("text", "")

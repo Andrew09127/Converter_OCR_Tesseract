@@ -1414,6 +1414,182 @@ def _is_letterhead_stop(text: str) -> bool:
     return bool(_LETTERHEAD_STOP_RE.search(text.casefold()))
 
 
+# ── Угловой штамп (письма ФНС и т.п.) ────────────────────────────────────────
+# Дата/№ и «На №» — печатные токены, которые оставляем текстом; всё прочее
+# без ≥3 кириллических букв подряд в зоне штампа — OCR-мусор от рукописи.
+_CORNER_KEEP_RE = re.compile(r'\d{2}\.\d{2}\.\d{4}|№|\bНа\b', re.IGNORECASE)
+_CYR3_RE = re.compile(r'[А-Яа-яЁё]{3}')
+
+
+def _detect_corner_letterhead(
+    text_zone: list[tuple[int, object, object, str]],  # (idx, item, bbox, text)
+    pic_bbox,
+    pw: float,
+) -> tuple[list, list] | None:
+    """Детект «углового штампа»: герб в ЛЕВОЙ половине, а текст верхней зоны
+    образует два непересекающихся x-кластера — узкая левая колонка штампа
+    (все r <= 0.55pw) и правая колонка адресата (все x0 >= 0.45pw).
+
+    Возвращает (left_cluster, right_cluster) — списки элементов text_zone —
+    или None, если раскладка не похожа на угловой штамп."""
+    if pic_bbox is None or pw <= 0:
+        return None
+    pic_cx = (float(getattr(pic_bbox, "l", 0)) + float(getattr(pic_bbox, "r", 0))) / 2
+    if pic_cx >= pw * 0.5:
+        return None
+    left, right = [], []
+    for entry in text_zone:
+        bbox = entry[2]
+        x0 = float(getattr(bbox, "l", 0))
+        x1 = float(getattr(bbox, "r", 0))
+        if x1 <= pw * 0.55:
+            left.append(entry)
+        elif x0 >= pw * 0.45:
+            right.append(entry)
+        else:
+            return None        # блок пересекает обе половины — не двухколонник
+    if len(left) < 3 or len(right) < 3:
+        return None
+    # Правая колонка углового штампа ПРАВОВЫРОВНЕНА (адресат прижат к полю).
+    # Колонка «значений» у меточной шапки (ПСБ и т.п.) имеет рваный правый
+    # край — это не угловой штамп, corner-рендер разорвёт пары метка-значение.
+    at_right = sum(1 for e in right
+                   if float(getattr(e[2], "r", 0)) >= pw * 0.86)
+    if at_right < 0.6 * len(right):
+        return None
+    return left, right
+
+
+def _crop_page_image(dl_doc, page_no: int, l_pt: float, top_pt: float,
+                     r_pt: float, bottom_pt: float, pw: float, ph: float):
+    """Вырезает прямоугольник из page image (экранные pt-координаты).
+    None если изображение страницы недоступно."""
+    try:
+        page = dl_doc.pages.get(page_no)
+        pil = page.image.pil_image if page is not None and page.image else None
+        if pil is None:
+            return None
+        sx = pil.width / pw
+        sy = pil.height / ph
+        box = (max(int(l_pt * sx), 0), max(int(top_pt * sy), 0),
+               min(int(r_pt * sx), pil.width), min(int(bottom_pt * sy), pil.height))
+        if box[2] - box[0] < 4 or box[3] - box[1] < 4:
+            return None
+        return pil.crop(box)
+    except Exception as exc:
+        log.debug("crop_page_image: %s", exc)
+        return None
+
+
+def _render_corner_letterhead(
+    doc, dl_doc, page_no: int, pw: float, ph: float, pdf_native: bool,
+    pil_img, pic_w_pt: float, img_w_inch: float, pic_idx: int,
+    left: list, right: list,
+) -> set[int]:
+    """Рендер углового штампа: [герб + центрированная колонка | правая колонка
+    с выключкой вправо]. Печатный текст остаётся ТЕКСТОМ; рукописные дата/№
+    (OCR-мусор без кириллицы) заменяются картинкой-кропом строки из скана.
+    Возвращает skip-индексы (пусто = corner-рендер не удался)."""
+    if doc is None:
+        return set()
+
+    def _top(e):
+        return _bbox_top_bottom(e[2], ph, pdf_native)[0]
+
+    def _bot(e):
+        return _bbox_top_bottom(e[2], ph, pdf_native)[1]
+
+    left = sorted(left, key=_top)
+    right = sorted(right, key=_top)
+
+    # Границы левой колонки (для ширины ячеек и кропов рукописи)
+    l_min = min(float(getattr(e[2], "l", 0)) for e in left)
+    l_max = max(float(getattr(e[2], "r", 0)) for e in left)
+    r_min = min(float(getattr(e[2], "l", 0)) for e in right)
+
+    # ── Рукописные строки: блоки без кириллицы и без дата/№-паттернов ──
+    hand = [e for e in left
+            if not _CYR3_RE.search(e[3]) and not _CORNER_KEEP_RE.search(e[3])]
+    hand_rows: list[tuple[float, float]] = []     # (y0, y1) в экранных pt
+    for e in sorted(hand, key=_top):
+        t, b = _top(e), _bot(e)
+        if hand_rows and t <= hand_rows[-1][1] + 4:
+            hand_rows[-1] = (hand_rows[-1][0], max(hand_rows[-1][1], b))
+        else:
+            hand_rows.append((t, b))
+
+    def _in_hand_row(e) -> tuple[float, float] | None:
+        mid = (_top(e) + _bot(e)) / 2
+        for y0, y1 in hand_rows:
+            if y0 - 2 <= mid <= y1 + 2:
+                return (y0, y1)
+        return None
+
+    left_blocks: list[tuple[float, dict]] = []    # (top, block)
+    used_rows: set[tuple[float, float]] = set()
+    for e in left:
+        row = _in_hand_row(e)
+        if row is not None:
+            if row not in used_rows:
+                used_rows.add(row)
+                crop = _crop_page_image(dl_doc, page_no, l_min - 4, row[0] - 3,
+                                        l_max + 6, row[1] + 8, pw, ph)
+                if crop is not None:
+                    left_blocks.append((row[0], {
+                        "image": crop,
+                        "image_width_inch": (l_max - l_min + 10) / 72,
+                        "alignment": WD_ALIGN_PARAGRAPH.CENTER,
+                    }))
+                    log.info("corner: рукописная строка y=%.0f..%.0f — кроп",
+                             row[0], row[1])
+            continue
+        text = e[3]
+        alpha = [c for c in text if c.isalpha()]
+        bold = bool(alpha) and all(c.isupper() for c in alpha) and len(text) <= 60
+        left_blocks.append((_top(e), {
+            "text": text, "font_pt": 8.0, "bold": bold, "italic": False,
+            "alignment": WD_ALIGN_PARAGRAPH.CENTER,
+        }))
+
+    right_blocks: list[dict] = []
+    for e in right:
+        text = e[3]
+        if not _CYR3_RE.search(text) and not _CORNER_KEEP_RE.search(text):
+            log.info("corner: мусор в правой колонке пропущен: %r", text[:30])
+            continue
+        right_blocks.append({
+            "text": text, "font_pt": 10.0, "bold": False, "italic": False,
+            "alignment": WD_ALIGN_PARAGRAPH.RIGHT,
+        })
+    if not right_blocks or not left_blocks:
+        return set()
+
+    margin = MARGIN_INCH * 72
+    mid = (l_max + r_min) / 2
+    left_w_pt = max(mid - margin, 72.0)
+    right_w_pt = max((pw - margin) - mid, 72.0)
+
+    cells = [
+        {
+            "kind": "text",
+            "blocks": [b for _, b in sorted(left_blocks, key=lambda x: x[0])],
+            "width_pt": left_w_pt,
+            "alignment": WD_ALIGN_PARAGRAPH.CENTER,
+            "image": pil_img,
+            "image_width_inch": min(img_w_inch, left_w_pt / 72 - 0.1),
+        },
+        {
+            "kind": "text",
+            "blocks": right_blocks,
+            "width_pt": right_w_pt,
+            "alignment": WD_ALIGN_PARAGRAPH.RIGHT,
+        },
+    ]
+    text_w_inch = (pw - 2 * margin) / 72
+    add_header_row(doc, cells, text_w_inch)
+    return {pic_idx, *(e[0] for e in left), *(e[0] for e in right)}
+
+
 def _render_first_page_letterhead(
     doc,
     dl_doc,
@@ -1521,6 +1697,54 @@ def _render_first_page_letterhead(
     img_w_inch = min(max(pic_w_pt / 72, 0.5), text_w_inch)
     log.info("letterhead: pic_l=%.1f pic_r=%.1f pic_w_pt=%.1f img_w_inch=%.3f",
              pic_l, pic_r, pic_w_pt, img_w_inch)
+
+    # ── Угловой штамп (письма ФНС): герб над центрированной левой колонкой,
+    # правая колонка адресата с выключкой вправо. Зона ограничивается
+    # ГЕОМЕТРИЧЕСКИ (первый блок через обе половины страницы), а не
+    # стоп-словами: «Должник:» в правой колонке — не конец шапки.
+    _zone_all: list[tuple[int, object, object, str, float, float]] = []
+    _span_tops: list[float] = []
+    for idx, (item, _level) in enumerate(all_items):
+        if idx == pic_idx:
+            continue
+        lbl = _label_str(item)
+        if lbl not in {"paragraph", "text", "list_item", "caption",
+                       "section_header", "title"}:
+            continue
+        bbox, page_no = _item_bbox_page(item, first_page)
+        if page_no != first_page or bbox is None:
+            continue
+        top, bottom = _bbox_top_bottom(bbox, ph, pdf_native)
+        text = postprocess((getattr(item, "text", None) or "").strip())
+        if not text:
+            continue
+        _x0 = float(getattr(bbox, "l", 0)); _x1 = float(getattr(bbox, "r", 0))
+        if _x0 < pw * 0.45 and _x1 > pw * 0.55 and top > pic_top:
+            _span_tops.append(top)          # блок через обе половины — конец зоны
+            continue
+        # Центрированный заголовок («Заявление…») тоже завершает зону, даже
+        # если он короткий и не пересекает обе половины страницы.
+        if (lbl in ("section_header", "title") and top > pic_top
+                and abs((_x0 + _x1) / 2 - pw / 2) < pw * 0.08):
+            _span_tops.append(top)
+            continue
+        _zone_all.append((idx, item, bbox, text, top, bottom))
+    _zone_bottom = min(_span_tops) if _span_tops else ph * 0.45
+    _zone = [(i, it, bb, tx) for (i, it, bb, tx, t, b) in _zone_all
+             if b <= _zone_bottom + 2.0]
+    _corner = _detect_corner_letterhead(_zone, pic_bbox, pw)
+    if _corner is not None:
+        _cl, _cr = _corner
+        _skip = _render_corner_letterhead(
+            doc, dl_doc, first_page, pw, ph, pdf_native,
+            pil_img, pic_w_pt, img_w_inch, pic_idx, _cl, _cr)
+        if _skip:
+            log.info("letterhead: угловой штамп — %d блоков в 2-колоночной шапке",
+                     len(_skip) - 1)
+            if logo_only:
+                # corner-рендер уже построил полную шапку — native_header не нужен
+                return _skip, [], None, 0.0, 0.0
+            return _skip, []
 
     left_blocks = []
     right_blocks = []
