@@ -1549,6 +1549,7 @@ def _render_corner_letterhead(
         left_blocks.append((_top(e), {
             "text": text, "font_pt": 8.0, "bold": bold, "italic": False,
             "alignment": WD_ALIGN_PARAGRAPH.CENTER,
+            "space_before": 3.0,     # межстрочный воздух, как в оригинале
         }))
 
     right_blocks: list[dict] = []
@@ -1560,6 +1561,7 @@ def _render_corner_letterhead(
         right_blocks.append({
             "text": text, "font_pt": 10.0, "bold": False, "italic": False,
             "alignment": WD_ALIGN_PARAGRAPH.RIGHT,
+            "space_before": 3.0,
         })
     if not right_blocks or not left_blocks:
         return set()
@@ -1739,6 +1741,11 @@ def _render_first_page_letterhead(
             doc, dl_doc, first_page, pw, ph, pdf_native,
             pil_img, pic_w_pt, img_w_inch, pic_idx, _cl, _cr)
         if _skip:
+            # Прочие картинки зоны шапки (Docling делает picture и из
+            # рукописной строки) — тоже в skip, иначе кроп задвоится.
+            for _pi, _pit, _pbb, _pt, _pb in pictures:
+                if _pi != pic_idx and _pb <= _zone_bottom + 2.0:
+                    _skip.add(_pi)
             log.info("letterhead: угловой штамп — %d блоков в 2-колоночной шапке",
                      len(_skip) - 1)
             if logo_only:
@@ -2457,6 +2464,7 @@ def build_docx(
                     _aspect  = _ih / _iw if _iw > 0 else 1.0
                     _tw      = min(text_w_inch, (ph - 2 * MARGIN_INCH * 72) / 72 / _aspect)
                     _para.add_run().add_picture(_buf, width=Inches(max(_tw, 0.5)))
+                    _last_body_para = None   # разрыв след. страницы — после картинки
                     log.info("[стр%d] PAGE_IMAGE: вставлена страница как картинка %dx%d px",
                              page_no, pil_img.width, pil_img.height)
             except Exception as _exc:
@@ -2546,6 +2554,9 @@ def build_docx(
                     add_table_from_cells(doc, item, text_w_inch=_tw_in)
                 elif hasattr(data, "grid") and data.grid:
                     add_table_from_grid(doc, data.grid)
+                # Иначе разрыв СЛЕДУЮЩЕЙ страницы уйдёт в абзац ПЕРЕД таблицей
+                # (два разрыва в одном абзаце = пустой лист, таблицы после них)
+                _last_body_para = None
             except Exception as exc:
                 log.warning("[стр%d] table: пропущена — %s", page_no, exc)
             continue
@@ -2642,6 +2653,7 @@ def build_docx(
                     para.paragraph_format.space_before = Pt(4)
                     para.paragraph_format.space_after  = Pt(4)
                     para.add_run().add_picture(buf, width=Inches(target_w_inch))
+                _last_body_para = None   # разрыв след. страницы — после картинки
             except Exception as exc:
                 log.debug("Picture skipped: %s", exc)
             continue
