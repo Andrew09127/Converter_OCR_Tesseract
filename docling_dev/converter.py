@@ -38,6 +38,7 @@ from .geometry import (
     bbox_h, bbox_mid_y, bbox_x0, coplanar,
     detect_pdf_native, sort_reading_order,
 )
+from .highlight import is_junk_text
 from .ocr_fixes import postprocess
 from .ocr_preprocess import is_junk_image
 from .page_analyser import (
@@ -2711,6 +2712,12 @@ def build_docx(
             log.info("[стр%d] пропуск микро-блока (h=%.1fpt): %r",
                      page_no, bbox_h(bbox), text)
             continue
+        # Короткий блок-мусор (обрывок пятна/штампа: «t», «ч», «theme cow»,
+        # «19/2 t aad Ger») — ни кир-слова, ни реквизита, ни email/URL. Только
+        # для тела; заголовки/подписи и длинные абзацы не трогаем.
+        if lbl in ("text", "paragraph", "list_item") and is_junk_text(text):
+            log.info("[стр%d] пропуск мусор-блока: %r", page_no, text[:30])
+            continue
 
         # Логируем значимые исправления OCR (изменение >= 3 символов или 5% текста)
         if raw_text != text:
@@ -3117,13 +3124,23 @@ def build_docx(
             # Heading-блоки в правой части страницы (x0 > 42% ширины) получают
             # left_indent чтобы совпасть с правой колонкой label:content таблиц.
             _h_lm = page_left_min.get(page_no, 0.0)
+            _pinfo_h = page_infos.get(page_no)
+            _rj_page = _pinfo_h is not None and getattr(_pinfo_h, "right_justified", False)
+            # Правовыровненная шапка заявления (В Арбитражный суд… Кредиторы:/
+            # «N. ООО …»): заголовки в правой части флашатся ВПРАВО к полю БЕЗ
+            # левого отступа. Иначе большой left_indent (из x0 в правой половине)
+            # зажимает короткий заголовок в узкую полосу → перенос по слову/слогу.
+            if _rj_page and _h_x0 > pw * 0.42:
+                alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                para.alignment = alignment
+                para.paragraph_format.left_indent = Pt(0)
             # Метки-заголовки правой КОЛОНКИ-ШАПКИ заявления (Кредитор:/Должник:/
             # Финансовый управляющий:) — кончаются на ":" и стоят в правой части.
             # Выравниваем ПО ЛЕВому краю колонки с тем же отступом, что и текстовые
             # соседи блока (иначе section_header центрируется/уезжает к левому полю).
             # Заголовки без ":" сюда НЕ попадают. alignment != CENTER: центрированные
             # заголовки остаются по ЦЕНТРУ
-            if (text.rstrip().endswith(":") and _h_x0 > pw * 0.42
+            elif (text.rstrip().endswith(":") and _h_x0 > pw * 0.42
                     and alignment != WD_ALIGN_PARAGRAPH.CENTER):
                 alignment = WD_ALIGN_PARAGRAPH.LEFT
                 para.alignment = alignment

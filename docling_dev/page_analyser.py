@@ -43,6 +43,9 @@ class PageInfo:
     columns:    list[ColumnBounds] = field(default_factory=list)
     median_h:   float             = 0.0
     left_min:   float             = 0.0
+    # Шапка страницы выключена ВПРАВО (заявление физлица: «В Арбитражный суд…
+    # от Должника… Кредиторы:»): рваный левый край, правые края у поля.
+    right_justified: bool         = False
 
     @property
     def is_multicolumn(self) -> bool:
@@ -175,6 +178,7 @@ def analyse_pages(items: list) -> dict[int, PageInfo]:
                 # (рваный левый край), а правые края сходятся у правого поля.
                 # Это НЕ колонки — выключка вправо.
                 cols = []
+                info.right_justified = True
             if len(cols) >= 2:
                 info.page_type = PAGE_MULTICOLUMN
                 info.columns   = cols

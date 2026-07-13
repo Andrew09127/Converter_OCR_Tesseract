@@ -1140,6 +1140,43 @@ def test_junk_image_solid_logo_kept():
     assert _is_junk_image(_PILImage.fromarray(img)) is False
 
 
+#  HIGHLIGHT — фильтр коротких блоков-мусора (is_junk_text)
+
+from docling_dev.highlight import is_junk_text as _is_junk_text
+
+
+def test_junk_text_drops_noise():
+    """Короткие блоки-обрывки OCR — мусор."""
+    for s in ["t", "ч", "м", "щ", "theme cow", "hype.", "19/2 t aad Ger",
+              "aad Ger", "AWAWNE", "rN", "", "  ", "|}{"]:
+        assert _is_junk_text(s) is True, s
+
+
+def test_junk_text_keeps_content():
+    """Содержательные блоки не трогаем: кир-слово, аббревиатура, число,
+    реквизит, email/URL, «№»-поле, имя собственное без словаря, длинный абзац."""
+    for s in ["Кредиторы:", "1. ПАО «Сбербанк»", "8. ООО «МКК НФ»",
+              "г. Ростов-на-Дону", "Дата", "Подпись", "2026",
+              "500 000", "231/4", "ИНН 7707083893", "На №",
+              "www.nalog.gov.ru", "tns-rostov@rostov.tns-e.ru",
+              "Мирский Алексей Степанович"]:
+        assert _is_junk_text(s) is False, s
+
+
+def test_junk_text_keeps_short_cyr_fragments():
+    """Двух+буквенные кир-фрагменты (предлоги разорванной строки) — НЕ мусор:
+    иначе из «в / лице / ИФНС» теряется слово."""
+    for s in ["в", "из", "на", "об", "ор", "лице"]:
+        assert _is_junk_text(s) is False, s
+
+
+def test_junk_text_long_block_not_judged():
+    """Длинный абзац с вкраплённым мусором НЕ удаляется целиком."""
+    s = ("rN Если, ero, - f 1. Перед ПАО «Сбербанк» общая сумма "
+         "задолженности составляет 9 713 руб. 03 коп")
+    assert _is_junk_text(s) is False
+
+
 def test_sort_tall_picture_does_not_chain_lines():
     """Высокая картинка (пятно/логотип) перекрывает несколько строк по
     вертикали, но НЕ сцепляет их в один ряд: строки сохраняют порядок по Y."""
