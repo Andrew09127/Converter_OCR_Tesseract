@@ -2,6 +2,8 @@
 from __future__ import annotations
 import re
 
+from .highlight import is_latin_homoglyph_word as _lat_homoglyph_word
+
 # ── Нормализация кавычек ──────────────────────────────────────────────────────
 _QUOTE_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r'<<\s*([^>\n]{1,300}?)\s*>>'),         r'«\1»'),
@@ -584,3 +586,96 @@ def postprocess(text: str) -> str:
     text = _LATIN_CAPS_RE.sub(_fix_caps_token, text)
     text = _restore_centrinvest_phone(text)
     return fix_quotes(text)
+
+
+# ── Инлайн-чистка тела: непарные скобки/кавычки + одиночные шум-токены ─────────
+_INLINE_NOISE_CHARS = set("|{}\\^~°*")         # символы, не встречающиеся в тексте
+_QUOTE_CHARS = "'\"«»‚’`“”"
+_GLUED_CLOSE_QUOTE_RE = re.compile(r'»(?=[А-Яа-яЁёA-Za-z])')  # »Санколлект → Санколлект
+_LETTERS_RE = re.compile(r'[^A-Za-zА-Яа-яЁё]')
+# Валидные однобуквенные русские слова: одиночная такая буква — не мусор.
+_CYR_1LETTER_OK = set("аиоувкся")
+
+
+def _remove_unmatched_pairs(text: str, op: str, cl: str) -> str:
+    """Удаляет НЕПАРНЫЕ op/cl (стек): орфанный «)» без «(» и наоборот."""
+    stack: list[int] = []
+    remove: set[int] = set()
+    for i, c in enumerate(text):
+        if c == op:
+            stack.append(i)
+        elif c == cl:
+            if stack:
+                stack.pop()
+            else:
+                remove.add(i)
+    remove.update(stack)
+    if not remove:
+        return text
+    return "".join(c for i, c in enumerate(text) if i not in remove)
+
+
+def _homoglyph_fix_token(tok: str) -> str:
+    """Если буквенное ядро токена — латиница-гомоглиф известного рус. слова
+    («Ha»→«На», «He»→«Не»), заменить на кириллицу. Иначе токен без изменений.
+    Спасает слова-мисриды от удаления правилом «короткая латиница-мусор»."""
+    core = tok.strip(_QUOTE_CHARS)
+    letters = _LETTERS_RE.sub("", core)
+    if letters and letters.isascii() and len(letters) <= 4:
+        cyr = _lat_homoglyph_word(letters)
+        if cyr:
+            return tok.replace(letters, cyr, 1)
+    return tok
+
+
+def _is_noise_token(tok: str) -> bool:
+    """True если токен — инлайн-мусор. Мусор: только кавычки/апострофы (непарные),
+    только шум-символы (| } \\ ° * ^ ~), короткая латиница ≤3 букв («ero», «i», «f»
+    — среди русского текста это OCR-шум; 4+ букв как «GmbH»/«NISSAN» сохраняем),
+    одиночная НЕсловарная кириллица («Й», «ц»; предлоги «в»/«с» сохраняем).
+    Числа, пунктуация-слова, парные знаки — НЕ мусор."""
+    t = tok.strip()
+    if not t:
+        return False
+    core = t.strip(_QUOTE_CHARS)
+    if not core:                                    # только кавычки/апострофы
+        return True
+    if any(c.isdigit() for c in core):              # есть цифра — число/реквизит
+        return False
+    if all(c in _INLINE_NOISE_CHARS for c in core):  # только шум-символы
+        return True
+    letters = _LETTERS_RE.sub("", core)
+    if letters:
+        # Короткая СТРОЧНАЯ латиница — OCR-шум («ero», «ees», «rs», «i», «f»).
+        # Заглавную/смешанную (коды моделей «JF», «IL», «GmbH») НЕ трогаем.
+        if letters.isascii() and len(letters) <= 3 and letters.islower():
+            return True
+        # ГОЛАЯ одиночная кириллица («ч», «Й») — мусор; «п.»/«л.»/«г.» (буква+точка)
+        # — сокращения, НЕ трогаем (len(core)==1 отсекает их).
+        if len(core) == 1 and not letters.isascii():
+            return core.lower() not in _CYR_1LETTER_OK
+    return False
+
+
+def clean_body_text(text: str) -> str:
+    """Снимает инлайн-OCR-мусор из абзаца тела/заголовка (в таблицах НЕ вызывается):
+    закрывающую кавычку, приклеенную к слову («»Санколлект»→«Санколлект»), непарные
+    « » ( ) [ ], и одиночные шум-токены (лат. буква, |}\\°*^~, одинокие кавычки).
+    Числа, слова, парные знаки, предлоги — сохраняются."""
+    if not text:
+        return text
+    text = _GLUED_CLOSE_QUOTE_RE.sub("", text)
+    # Балансируем только скобки. Кавычки «» НЕ балансируем: длинная цитата
+    # («Об утверждении…») часто разорвана между блоками — тогда открывающая «
+    # без закрытия ЛЕГИТИМНА. Стрелые закрывающие »-к-слову ловит glued-регекс выше.
+    for op, cl in (("(", ")"), ("[", "]")):
+        text = _remove_unmatched_pairs(text, op, cl)
+    kept: list[str] = []
+    for t in text.split(" "):
+        t = _homoglyph_fix_token(t)     # «Ha»→«На» ДО проверки на латиницу-мусор
+        if _is_noise_token(t):
+            continue
+        t = t.strip("'\"`‚’")           # снять приклеенные ПРЯМЫЕ кавычки/апострофы («» не трогаем)
+        if t:
+            kept.append(t)
+    return re.sub(r"\s{2,}", " ", " ".join(kept)).strip()

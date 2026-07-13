@@ -39,7 +39,7 @@ from .geometry import (
     detect_pdf_native, sort_reading_order,
 )
 from .highlight import is_junk_text
-from .ocr_fixes import postprocess
+from .ocr_fixes import clean_body_text, postprocess
 from .ocr_preprocess import is_junk_image
 from .page_analyser import (
     analyse_pages as analyse_page_infos,
@@ -2696,6 +2696,11 @@ def build_docx(
         # ── Получаем текст из Docling (word_order меняет только порядок блоков) ──
         raw_text = (getattr(item, "text", None) or "").strip()
         text = postprocess(raw_text)
+        # Инлайн-чистка тела/заголовков: непарные скобки/кавычки и шум-токены.
+        # Таблицы (add_table_from_*) сюда не попадают — их текст чистится отдельно.
+        if lbl in ("text", "paragraph", "list_item", "section_header",
+                   "title", "caption"):
+            text = clean_body_text(text)
         if not text:
             log.debug("[стр%d] idx=%d lbl=%s: пустой текст — пропуск", page_no, idx, lbl)
             continue
@@ -3121,34 +3126,26 @@ def build_docx(
             para.paragraph_format.widow_control  = False
             para.paragraph_format.keep_with_next = False
             para.paragraph_format.keep_together  = False
-            # Heading-блоки в правой части страницы (x0 > 42% ширины) получают
-            # left_indent чтобы совпасть с правой колонкой label:content таблиц.
             _h_lm = page_left_min.get(page_no, 0.0)
-            _pinfo_h = page_infos.get(page_no)
-            _rj_page = _pinfo_h is not None and getattr(_pinfo_h, "right_justified", False)
-            # Правовыровненная шапка заявления (В Арбитражный суд… Кредиторы:/
-            # «N. ООО …»): заголовки в правой части флашатся ВПРАВО к полю БЕЗ
-            # левого отступа. Иначе большой left_indent (из x0 в правой половине)
-            # зажимает короткий заголовок в узкую полосу → перенос по слову/слогу.
-            if _rj_page and _h_x0 > pw * 0.42:
-                alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                para.alignment = alignment
+            # Правовыровненный заголовок шапки заявления и ЕЁ ПРОДОЛЖЕНИЯ на
+            # след. странице (Кредиторы:/«N. ООО …»/Уполномоченный орган:) —
+            # выключка ВПРАВО к полю (align=RIGHT, дотягивается до края) в правой
+            # части листа. Флашим без left_indent: иначе большой отступ (из x0 в
+            # правой половине) зажимает короткий заголовок в узкую полосу →
+            # перенос по слову/слогу. Признак — сам блок (RIGHT+x0), не флаг
+            # страницы: продолжение списка на стр.2 детект колонок не помечает rj.
+            if alignment == WD_ALIGN_PARAGRAPH.RIGHT and _h_x0 > pw * 0.42:
                 para.paragraph_format.left_indent = Pt(0)
-            # Метки-заголовки правой КОЛОНКИ-ШАПКИ заявления (Кредитор:/Должник:/
-            # Финансовый управляющий:) — кончаются на ":" и стоят в правой части.
-            # Выравниваем ПО ЛЕВому краю колонки с тем же отступом, что и текстовые
-            # соседи блока (иначе section_header центрируется/уезжает к левому полю).
-            # Заголовки без ":" сюда НЕ попадают. alignment != CENTER: центрированные
-            # заголовки остаются по ЦЕНТРУ
+            # Метки-заголовки ЛЕВОвыровненной правой КОЛОНКИ (ФНС/ПСБ: Кредитор:/
+            # Должник:/Финансовый управляющий:) — кончаются на ":", НЕ дотянуты до
+            # поля (align != RIGHT). Выравниваем по левому краю колонки с отступом
+            # соседей блока. alignment != CENTER: центрированные — по центру.
             elif (text.rstrip().endswith(":") and _h_x0 > pw * 0.42
                     and alignment != WD_ALIGN_PARAGRAPH.CENTER):
                 alignment = WD_ALIGN_PARAGRAPH.LEFT
                 para.alignment = alignment
                 # Отступ прищёлкиваем к уровню документа — метка встаёт в одну
                 # вертикаль с текстовыми блоками той же колонки.
-                para.paragraph_format.left_indent = Pt(
-                    snap_indent(max(_h_x0 - _h_lm, 0.0), indent_levels))
-            elif alignment == WD_ALIGN_PARAGRAPH.RIGHT and _h_x0 > pw * 0.42:
                 para.paragraph_format.left_indent = Pt(
                     snap_indent(max(_h_x0 - _h_lm, 0.0), indent_levels))
             else:

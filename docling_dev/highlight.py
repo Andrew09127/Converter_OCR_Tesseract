@@ -177,6 +177,18 @@ _REAL_URL_RE = re.compile(r"\w@\w|https?://|www\.|\.(?:ru|com|org|net|gov)\b",
 _CYR_1LETTER_WORDS = set("аиоувкся")
 
 
+def is_latin_homoglyph_word(core: str) -> str | None:
+    """Если core — латиница, ПОЛНОСТЬЮ конвертируемая гомоглифами в известное
+    русское слово (OCR-мисрид «Ha»→«На», «He»→«Не», «co»→«со»), вернуть кириллицу;
+    иначе None. Защищает реальные слова от удаления как «латиница-мусор»."""
+    if not core or _HAS_CYR.search(core) or not _HAS_LAT.search(core):
+        return None
+    conv = "".join(_LAT2CYR.get(c, "\0") for c in core)
+    if "\0" in conv:                     # какая-то буква — не гомоглиф-двойник
+        return None
+    return conv if _pymorphy_known(conv.lower()) else None
+
+
 def is_junk_text(text: str, max_len: int = 40) -> bool:
     """True если КОРОТКИЙ блок — целиком OCR-мусор (обрывок пятна/штампа): «t»,
     «ч», «theme cow», «19/2 t aad Ger», «aad Ger», «rN».
