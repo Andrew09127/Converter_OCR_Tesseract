@@ -1195,16 +1195,50 @@ def _bbox_ns(l, r, t=100, b=180):
 
 
 def test_corner_detected_fns():
-    """ФНС-шапка: герб слева, левый кластер (r<=0.55pw) + правый (x0>=0.45pw)."""
+    """ФНС-шапка правовыровненная (Зайцев): герб слева, левый кластер с маркером
+    налоговой шапки, правый кластер прижат к полю → right_align=RIGHT."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
     pw = 595.0
+    left_texts = ["ФЕДЕРАЛЬНАЯ НАЛОГОВАЯ СЛУЖБА", "УПРАВЛЕНИЕ ФНС по области",
+                  "МЕЖРАЙОННАЯ ИНСПЕКЦИЯ", "стр 4", "стр 5"]
     zone = (
-        [_zone_entry(60, 250, 100 + i * 15, f"строка штампа {i}") for i in range(5)]
+        [_zone_entry(60, 250, 100 + i * 15, left_texts[i]) for i in range(5)]
         + [_zone_entry(320, 560, 100 + i * 15, f"адресат {i}") for i in range(4)]
     )
     res = _detect_corner_letterhead(zone, _bbox_ns(120, 190), pw)
     assert res is not None
-    left, right = res
+    left, right, right_align = res
     assert len(left) == 5 and len(right) == 4
+    assert right_align == WD_ALIGN_PARAGRAPH.RIGHT
+
+
+def test_corner_detected_fns_left_aligned():
+    """ФНС-шапка левовыровненная (Артемов/Геворгян/6л): адресат с общим левым
+    краем и рваным правым → детект проходит, right_align=LEFT."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    pw = 595.0
+    left_texts = ["ФЕДЕРАЛЬНАЯ НАЛОГОВАЯ СЛУЖБА", "УПРАВЛЕНИЕ ФНС",
+                  "МЕЖРАЙОННАЯ ИНСПЕКЦИЯ", "l4", "l5"]
+    # правый кластер левовыровнен по x0=340, правый край рваный (400..480)
+    zone = (
+        [_zone_entry(60, 250, 100 + i * 15, left_texts[i]) for i in range(5)]
+        + [_zone_entry(340, 400 + i * 20, 100 + i * 15, f"адресат {i}") for i in range(5)]
+    )
+    res = _detect_corner_letterhead(zone, _bbox_ns(120, 190), pw)
+    assert res is not None
+    _left, _right, right_align = res
+    assert right_align == WD_ALIGN_PARAGRAPH.LEFT
+
+
+def test_corner_not_detected_non_fns():
+    """Левый кластер без маркеров ФНС — не наша шапка (защита от ложных
+    срабатываний на чужих двухколоночных раскладках)."""
+    pw = 595.0
+    zone = (
+        [_zone_entry(60, 250, 100 + i * 15, f"колонка {i}") for i in range(4)]
+        + [_zone_entry(320, 560, 100 + i * 15, f"адресат {i}") for i in range(4)]
+    )
+    assert _detect_corner_letterhead(zone, _bbox_ns(120, 190), pw) is None
 
 
 def test_corner_not_detected_logo_right():
@@ -1238,11 +1272,16 @@ def test_corner_not_detected_few_blocks():
     assert _detect_corner_letterhead(zone, _bbox_ns(120, 190), pw) is None
 
 
-def test_corner_not_detected_ragged_right():
-    """Правый кластер с рваным правым краем (метки/значения ПСБ) — не corner."""
+def test_corner_not_detected_scattered_right():
+    """Правый кластер БЕЗ единой колонки — две подколонки метка/значение с
+    разбросом и левого, и правого края (меточная шапка). Не адресат, не corner
+    даже при налоговом левом кластере."""
     pw = 595.0
+    left_texts = ["ФЕДЕРАЛЬНАЯ НАЛОГОВАЯ СЛУЖБА", "УПРАВЛЕНИЕ", "ИНСПЕКЦИЯ", "l4"]
+    # x0 скачет между 300 (метки) и 430 (значения), правый край тоже рваный
+    xs = [(300, 360), (430, 470), (300, 355), (430, 480), (300, 350), (430, 465)]
     zone = (
-        [_zone_entry(60, 250, 100 + i * 15, f"л{i}") for i in range(4)]
-        + [_zone_entry(320, 400 + i * 20, 100 + i * 15, f"п{i}") for i in range(5)]
+        [_zone_entry(60, 250, 100 + i * 15, left_texts[i]) for i in range(4)]
+        + [_zone_entry(x0, x1, 100 + i * 15, f"п{i}") for i, (x0, x1) in enumerate(xs)]
     )
     assert _detect_corner_letterhead(zone, _bbox_ns(120, 190), pw) is None

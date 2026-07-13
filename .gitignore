@@ -33,6 +33,7 @@ env/
 .vscode/
 .claude/
 /CLAUDE.md
+/handoff.md
 
 
 # dev-инструменты вёрстки (не коммитим)

@@ -1419,19 +1419,32 @@ def _is_letterhead_stop(text: str) -> bool:
 # без ≥3 кириллических букв подряд в зоне штампа — OCR-мусор от рукописи.
 _CORNER_KEEP_RE = re.compile(r'\d{2}\.\d{2}\.\d{4}|№|\bНа\b', re.IGNORECASE)
 _CYR3_RE = re.compile(r'[А-Яа-яЁё]{3}')
+# Идентичность письма ФНС: угловой штамп детектится только если левый кластер
+# содержит маркеры налоговой шапки. Якорь против ложных срабатываний на чужих
+# двухколоночных шапках (ПСБ и т.п.) — режим построен исключительно для ФНС.
+_FNS_ID_RE = re.compile(r'НАЛОГОВ|ИФНС|\bФНС\b|ИНСПЕКЦИЯ\s+ФЕДЕРАЛЬН', re.IGNORECASE)
+# Заголовок тела документа (центрированный, ниже шапки). Если такой блок из-за
+# рваной геометрии OCR попал в зону/правый кластер — его нельзя класть в колонку
+# адресата: рендерим ниже обычным центрированным абзацем.
+_DOC_TITLE_RE = re.compile(
+    r'^(ЗАЯВЛЕНИЕ|ХОДАТАЙСТВО|ОТЗЫВ|ВОЗРАЖЕНИ|ЗАМЕЧАНИ|ОБЪЯСНЕНИ|ПОЯСНЕНИ|ЖАЛОБА)',
+    re.IGNORECASE)
 
 
 def _detect_corner_letterhead(
     text_zone: list[tuple[int, object, object, str]],  # (idx, item, bbox, text)
     pic_bbox,
     pw: float,
-) -> tuple[list, list] | None:
-    """Детект «углового штампа»: герб в ЛЕВОЙ половине, а текст верхней зоны
-    образует два непересекающихся x-кластера — узкая левая колонка штампа
-    (все r <= 0.55pw) и правая колонка адресата (все x0 >= 0.45pw).
+) -> tuple[list, list, object] | None:
+    """Детект «углового штампа» письма ФНС: герб в ЛЕВОЙ половине, левый кластер
+    содержит маркеры налоговой шапки, а текст верхней зоны образует два
+    непересекающихся x-кластера — узкая левая колонка штампа (все r <= 0.55pw)
+    и правая колонка адресата (все x0 >= 0.45pw), когерентная как колонка
+    (право- либо левовыровнена).
 
-    Возвращает (left_cluster, right_cluster) — списки элементов text_zone —
-    или None, если раскладка не похожа на угловой штамп."""
+    Возвращает (left_cluster, right_cluster, right_align) — списки элементов
+    text_zone и выравнивание правой колонки (WD_ALIGN_PARAGRAPH.RIGHT/LEFT) —
+    или None, если раскладка не похожа на угловой штамп ФНС."""
     if pic_bbox is None or pw <= 0:
         return None
     pic_cx = (float(getattr(pic_bbox, "l", 0)) + float(getattr(pic_bbox, "r", 0))) / 2
@@ -1450,14 +1463,28 @@ def _detect_corner_letterhead(
             return None        # блок пересекает обе половины — не двухколонник
     if len(left) < 3 or len(right) < 3:
         return None
-    # Правая колонка углового штампа ПРАВОВЫРОВНЕНА (адресат прижат к полю).
-    # Колонка «значений» у меточной шапки (ПСБ и т.п.) имеет рваный правый
-    # край — это не угловой штамп, corner-рендер разорвёт пары метка-значение.
+    # Якорь идентичности: режим только для писем ФНС. Левый кластер обязан
+    # содержать маркеры налоговой шапки — иначе это чужая двухколоночная
+    # раскладка (ПСБ и т.п.), которую corner-рендер бы испортил.
+    if not any(_FNS_ID_RE.search(e[3]) for e in left):
+        return None
+    # Правая колонка адресата должна быть КОГЕРЕНТНОЙ колонкой — либо
+    # правовыровнена (адресат прижат к полю, как у Зайцева), либо
+    # левовыровнена по единому x0 (Артемов/Геворгян/6л). Разброс обоих краёв
+    # (метки+значения двумя подколонками) — не адресат, отклоняем.
     at_right = sum(1 for e in right
                    if float(getattr(e[2], "r", 0)) >= pw * 0.86)
-    if at_right < 0.6 * len(right):
+    # Левовыровненность: наибольшая группа блоков с общим левым краем (±16pt).
+    # Именно группа, а не min(x0): центрированный заголовок «ЗАЯВЛЕНИЕ» или
+    # строка-вставка с меньшим x0 не должна ломать кластер адресата.
+    x0s = [float(getattr(e[2], "l", 0)) for e in right]
+    at_left = max(sum(1 for b in x0s if abs(b - a) <= 16.0) for a in x0s)
+    if at_right < 0.6 * len(right) and at_left < 0.6 * len(right):
         return None
-    return left, right
+    # Выравнивание правой колонки для рендера: приоритет правовыровненности.
+    right_align = (WD_ALIGN_PARAGRAPH.RIGHT if at_right >= at_left
+                   else WD_ALIGN_PARAGRAPH.LEFT)
+    return left, right, right_align
 
 
 def _crop_page_image(dl_doc, page_no: int, l_pt: float, top_pt: float,
@@ -1484,12 +1511,13 @@ def _crop_page_image(dl_doc, page_no: int, l_pt: float, top_pt: float,
 def _render_corner_letterhead(
     doc, dl_doc, page_no: int, pw: float, ph: float, pdf_native: bool,
     pil_img, pic_w_pt: float, img_w_inch: float, pic_idx: int,
-    left: list, right: list,
+    left: list, right: list, right_align=WD_ALIGN_PARAGRAPH.RIGHT,
 ) -> set[int]:
     """Рендер углового штампа: [герб + центрированная колонка | правая колонка
-    с выключкой вправо]. Печатный текст остаётся ТЕКСТОМ; рукописные дата/№
-    (OCR-мусор без кириллицы) заменяются картинкой-кропом строки из скана.
-    Возвращает skip-индексы (пусто = corner-рендер не удался)."""
+    адресата]. Выравнивание правой колонки — right_align (RIGHT у Зайцева,
+    LEFT у Артемова/Геворгяна/6л). Печатный текст остаётся ТЕКСТОМ; рукописные
+    дата/№ (OCR-мусор без кириллицы) заменяются картинкой-кропом строки из
+    скана. Возвращает skip-индексы (пусто = corner-рендер не удался)."""
     if doc is None:
         return set()
 
@@ -1553,14 +1581,19 @@ def _render_corner_letterhead(
         }))
 
     right_blocks: list[dict] = []
+    title_skip: set[int] = set()      # индексы, которые НЕ скипаем (рендерятся ниже)
     for e in right:
         text = e[3]
+        if _DOC_TITLE_RE.match(text.strip()) and len(text.strip()) <= 20:
+            title_skip.add(e[0])
+            log.info("corner: заголовок тела в правой колонке — рендер ниже: %r", text[:30])
+            continue
         if not _CYR3_RE.search(text) and not _CORNER_KEEP_RE.search(text):
             log.info("corner: мусор в правой колонке пропущен: %r", text[:30])
             continue
         right_blocks.append({
             "text": text, "font_pt": 10.0, "bold": False, "italic": False,
-            "alignment": WD_ALIGN_PARAGRAPH.RIGHT,
+            "alignment": right_align,
             "space_before": 3.0,
         })
     if not right_blocks or not left_blocks:
@@ -1584,12 +1617,13 @@ def _render_corner_letterhead(
             "kind": "text",
             "blocks": right_blocks,
             "width_pt": right_w_pt,
-            "alignment": WD_ALIGN_PARAGRAPH.RIGHT,
+            "alignment": right_align,
         },
     ]
     text_w_inch = (pw - 2 * margin) / 72
     add_header_row(doc, cells, text_w_inch)
-    return {pic_idx, *(e[0] for e in left), *(e[0] for e in right)}
+    return {pic_idx, *(e[0] for e in left),
+            *(e[0] for e in right if e[0] not in title_skip)}
 
 
 def _render_first_page_letterhead(
@@ -1736,10 +1770,10 @@ def _render_first_page_letterhead(
              if b <= _zone_bottom + 2.0]
     _corner = _detect_corner_letterhead(_zone, pic_bbox, pw)
     if _corner is not None:
-        _cl, _cr = _corner
+        _cl, _cr, _right_align = _corner
         _skip = _render_corner_letterhead(
             doc, dl_doc, first_page, pw, ph, pdf_native,
-            pil_img, pic_w_pt, img_w_inch, pic_idx, _cl, _cr)
+            pil_img, pic_w_pt, img_w_inch, pic_idx, _cl, _cr, _right_align)
         if _skip:
             # Прочие картинки зоны шапки (Docling делает picture и из
             # рукописной строки) — тоже в skip, иначе кроп задвоится.
