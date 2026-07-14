@@ -855,6 +855,109 @@ def _join_fragments(all_items: list, continuation_ids: set) -> set:
     return continuation_ids
 
 
+def _hdr_mergeable(text: str) -> bool:
+    """Фрагмент можно вклеивать в строку шапки, только если он несёт содержание
+    (кириллица или цифры) либо это пунктуация/№. Чисто-латинский буквенный токен
+    (OCR-мусор «CRPAAMNPYNS», «WY») в кириллическую шапку не вклеиваем — иначе
+    мусор прилипает к заголовку («CRPAAMNPYNS Приложение:»)."""
+    has_cyr = bool(re.search(r'[А-Яа-яЁё]', text))
+    has_dig = any(c.isdigit() for c in text)
+    has_lat = bool(re.search(r'[A-Za-z]', text))
+    return has_cyr or has_dig or not has_lat
+
+
+def _merge_header_lines(all_items: list, page_sizes: dict, pdf_native: bool,
+                        skip_indices: set) -> int:
+    """Склейка пословно-разорванной шапки в цельные строки (убирает «лесенку»).
+
+    Docling на письмах ФНС дробит строку адресата/штампа на блоки-слова с ОДНИМ
+    top и растущим x0 («в / лице / Межрайонной / ИФНС / России / № / 26»); рендер
+    даёт каждому свой left_indent → визуальная лесенка. Здесь для зоны ШАПКИ
+    (сверху страницы до заголовка тела `_DOC_TITLE_RE`) блоки группируются в строки
+    по вертикали, внутри строки склеиваются соседи ОДНОЙ колонки (малый гор. зазор)
+    в левый блок; хвостовые фрагменты уходят в skip_indices. Границу колонок держит
+    порог зазора (левый штамп ≠ правый адресат), а слияние — только для КОРОТКИХ
+    фрагментов (≤3 слов): длинные абзацы тела не трогаются. Мутирует item.text и
+    bbox.r левого блока. Возвращает число склеенных фрагментов."""
+    from collections import defaultdict
+    MAX_FRAG_WORDS = 3
+    page_items: dict[int, list[int]] = defaultdict(list)
+    stopped: set[int] = set()
+    for idx, (item, _lvl) in enumerate(all_items):
+        prov = getattr(item, "prov", None) or []
+        if not prov:
+            continue
+        pg = int(getattr(prov[0], "page_no", -1))
+        if pg < 0 or pg in stopped:
+            continue
+        text = (getattr(item, "text", None) or "").strip()
+        if text and _DOC_TITLE_RE.match(text):
+            stopped.add(pg)                  # заголовок тела — конец зоны шапки
+            continue
+        if idx in skip_indices or not text:
+            continue
+        if _label_str(item) not in ("text", "paragraph", "section_header",
+                                     "title", "caption"):
+            continue
+        if getattr(prov[0], "bbox", None) is None:
+            continue
+        page_items[pg].append(idx)
+
+    merged_total = 0
+    for pg, idxs in page_items.items():
+        if len(idxs) < 2:
+            continue
+        pw, ph = page_sizes.get(pg, (595.0, 842.0))
+        recs = []                            # (idx, l, r, top, bottom)
+        for idx in idxs:
+            bbox = all_items[idx][0].prov[0].bbox
+            l = float(getattr(bbox, "l", 0)); r = float(getattr(bbox, "r", 0))
+            top, bot = _bbox_top_bottom(bbox, ph, pdf_native)
+            recs.append((idx, l, r, top, bot))
+        med_h = sorted(b - t for _, _, _, t, b in recs)[len(recs) // 2] or 8.0
+        row_tol = max(3.0, 0.5 * med_h)
+        col_gap = max(20.0, 2.5 * med_h)
+        recs.sort(key=lambda x: x[3])        # по top (0 = верх страницы)
+        rows: list[list] = []
+        for rec in recs:
+            if rows and abs(rec[3] - rows[-1][0][3]) <= row_tol:
+                rows[-1].append(rec)
+            else:
+                rows.append([rec])
+        for row in rows:
+            if len(row) < 2:
+                continue
+            row.sort(key=lambda x: x[1])     # по левому краю
+            groups: list[list] = [[row[0]]]
+            for rec in row[1:]:
+                if rec[1] - groups[-1][-1][2] <= col_gap:   # this.l - prev.r
+                    groups[-1].append(rec)
+                else:
+                    groups.append([rec])
+            for g in groups:
+                # чисто-латинский мусор в строку шапки не вклеиваем (см. _hdr_mergeable)
+                gm = [gr for gr in g
+                      if _hdr_mergeable(all_items[gr[0]][0].text or "")]
+                if len(gm) < 2:
+                    continue
+                frags = [all_items[gr[0]][0].text.strip() for gr in gm]
+                # слияние только коротких фрагментов — тело (длинные блоки) не трогаем
+                if any(len(f.split()) > MAX_FRAG_WORDS for f in frags):
+                    continue
+                lead_item = all_items[gm[0][0]][0]
+                lead_item.text = " ".join(frags)
+                try:
+                    lead_item.prov[0].bbox.r = max(gr[2] for gr in gm)
+                except Exception:
+                    pass
+                for gr in gm[1:]:
+                    skip_indices.add(gr[0])
+                merged_total += len(gm) - 1
+    if merged_total:
+        log.info("merge_header_lines: склеено %d фрагментов шапки", merged_total)
+    return merged_total
+
+
 # Основная функция построения DOCX
 
 _LETTERHEAD_STOP_RE = re.compile(
@@ -2100,7 +2203,12 @@ def build_docx(
         last_content_page = first_page_no
         log.info("native_header: пропускаем %d элементов шапки", len(native_indices))
 
-    # Детальный дамп стр.1 для диагностики рендера 
+    # Слияние пословно-разорванной шапки (лесенка ФНС): склеивает фрагменты строки
+    # в один блок ДО рендера. Выполняется после corner/native-скипов — их блоки
+    # не трогает. Мутирует item.text/bbox.r и добавляет хвосты в skip_indices.
+    _merge_header_lines(all_items, page_sizes, pdf_native, skip_indices)
+
+    # Детальный дамп стр.1 для диагностики рендера
     _pg1 = min(page_sizes.keys()) if page_sizes else 1
     _pw1, _ph1 = page_sizes.get(_pg1, (595.0, 842.0))
     log.info("=== ДАМП СТРАНИЦЫ %d  pw=%.0f ph=%.0f pdf_native=%s ===",
