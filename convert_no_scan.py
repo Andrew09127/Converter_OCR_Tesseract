@@ -164,12 +164,15 @@ class PDFPipelineConverter:
         словарной сегментации, поэтому корректные слова не шинкуются."""
         glue: dict[str, list[int]] = {}
         singles: set[str] = set()           # самостоятельные слова PDF — их НЕ трогаем
+        # Строки по блокам (в порядке следования) — для склеек на стыке соседних строк.
+        by_block: dict[tuple, list[list[str]]] = {}
         for page in pdf:
             # (x0, y0, x1, y1, "word", block_no, line_no, word_no)
             words = page.get_text("words")
             words.sort(key=lambda w: (w[5], w[6], w[7]))
-            for _, line in groupby(words, key=lambda w: (w[5], w[6])):
+            for (blk, _ln), line in groupby(words, key=lambda w: (w[5], w[6])):
                 toks = [w[4] for w in line]
+                by_block.setdefault((page.number, blk), []).append(toks)
                 for i in range(len(toks)):
                     acc, bounds = "", []
                     for n in range(1, cls._GLUE_MAX_N + 1):
@@ -184,6 +187,20 @@ class PDFPipelineConverter:
                             # setdefault: при коллизии оставляем самую короткую (раннюю)
                             # разбивку — она однозначнее
                             glue.setdefault(acc.lower(), list(bounds))
+        # СКЛЕЙКА НА СТЫКЕ СОСЕДНИХ СТРОК ОДНОГО БЛОКА: слово/словосочетание перенесено
+        # на след. строку, а pdf2docx убрал и перенос, и пробел («Центрального»⏎
+        # «федерального» → «Центральногофедерального»). Обычный перенос → вставляем
+        # пробел на стыке (граница = длина левого слова). Дефис-перенос («об-»/«ласти»)
+        # здесь НЕ трогаем — это снятие дефиса, иная операция (отдельный шаг).
+        for lines in by_block.values():
+            for k in range(len(lines) - 1):
+                left, right = lines[k], lines[k + 1]
+                if not left or not right:
+                    continue
+                a, b2 = left[-1], right[0]
+                if not a or not b2 or a.endswith("-"):
+                    continue
+                glue.setdefault((a + b2).lower(), [len(a)])
         # Защита от ложных разрезов: если склеенная форма совпадает с реальным
         # самостоятельным словом (напр. «дело» = «дел» + «о»), не расклеиваем его.
         for key in singles:
