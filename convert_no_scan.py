@@ -134,20 +134,11 @@ class PDFPipelineConverter:
             logging.info("Полнота текста %s: OK — потерь не найдено", pdf_path.name)
             return
 
-        try:
-            d.add_page_break()
-            d.add_paragraph("[Восстановленный текст — pdf2docx не перенёс эти строки в вёрстку]")
-            cur_page = None
-            for page_no, s in missing:
-                if page_no != cur_page:     # заголовок-ориентир: откуда взята строка
-                    cur_page = page_no
-                    d.add_paragraph(f"— страница {page_no} —")
-                d.add_paragraph(s)
-            d.save(str(docx_path))
-            logging.warning("%s: pdf2docx потерял %d строк — дописаны в конец DOCX "
-                            "(полнота восстановлена)", pdf_path.name, len(missing))
-        except Exception as exc:
-            logging.error("Полнота: не дописать восстановленный текст в %s: %s", docx_path.name, exc)
+        # По решению Андрея хвостовой блок «[Восстановленный текст …]» в DOCX больше НЕ
+        # дописываем (он захламлял конец документа подвалом/почтой). Потери только
+        # ЛОГИРУЕМ — сам DOCX не трогаем, вёрстка остаётся чистой.
+        logging.warning("%s: pdf2docx потерял %d строк — НЕ дописываем в DOCX "
+                        "(блок восстановления отключён по решению)", pdf_path.name, len(missing))
 
     # Длина окна n-грамм: сколько подряд идущих слов PDF склеиваем в один ключ.
     # 6 покрывает реальные склейки pdf2docx (обычно 2-4 слова) с запасом.
