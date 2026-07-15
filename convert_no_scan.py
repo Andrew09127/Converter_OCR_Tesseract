@@ -308,6 +308,48 @@ class PDFPipelineConverter:
             except Exception as exc:
                 logging.error("Расклейка: не сохранить %s: %s", docx_path.name, exc)
 
+    # Закрывающая кавычка », у которой ПЕРЕД ней пробел, а ПОСЛЕ — буква: это на деле
+    # ОТКРЫВАЮЩАЯ кавычка, неверно повёрнутая pdf2docx при конвертации прямых кавычек
+    # («… "ДЕЛО"» распозналось как «… »ДЕЛО»»). Диапазоны кириллицы — unicode-escape'ами,
+    # чтобы не зависеть от кодировки исходника. Настоящая закрывающая » идёт вплотную
+    # к слову (без пробела перед), поэтому такой случай сюда не попадает.
+    _MISPLACED_OPEN_QUOTE_RE = re.compile(
+        "(?<=\\s)»(?=[А-Яа-яЁёA-Za-z])"
+    )
+
+    def _fix_quote_direction(self, docx_path) -> None:
+        """Чинит неверно повёрнутую кавычку »→« (см. _MISPLACED_OPEN_QUOTE_RE)."""
+        try:
+            d = Document(str(docx_path))
+        except Exception as exc:
+            logging.warning("Кавычки: не открыть DOCX %s: %s", docx_path.name, exc)
+            return
+
+        def fix_paragraph(paragraph) -> int:
+            n = 0
+            for run in paragraph.runs:
+                if "»" in run.text:
+                    new = self._MISPLACED_OPEN_QUOTE_RE.sub("«", run.text)
+                    if new != run.text:
+                        run.text = new
+                        n += 1
+            return n
+
+        changed = 0
+        for paragraph in d.paragraphs:
+            changed += fix_paragraph(paragraph)
+        for table in d.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        changed += fix_paragraph(paragraph)
+        if changed:
+            try:
+                d.save(str(docx_path))
+                logging.info("Кавычки %s: повёрнуто »→« — %d", docx_path.name, changed)
+            except Exception as exc:
+                logging.error("Кавычки: не сохранить %s: %s", docx_path.name, exc)
+
     def convert_single_pdf(self, pdf_path, docx_path):
         """Конвертация одного PDF в редактируемый DOCX"""
         converter = None
@@ -326,6 +368,9 @@ class PDFPipelineConverter:
             # ВАЖНО до _recover_missing_text — расклеенный текст лучше сверяется
             # пословно, поэтому ложных «потерь» меньше.
             self._fix_glued_words(pdf_path, docx_path)
+
+            # Кавычки: pdf2docx мог неверно повернуть открывающую кавычку (»ДЕЛО → «ДЕЛО).
+            self._fix_quote_direction(docx_path)
 
             # Гарантия полноты: дописываем текст, который pdf2docx потерял
             self._recover_missing_text(pdf_path, docx_path)
