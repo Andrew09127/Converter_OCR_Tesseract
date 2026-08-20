@@ -37,6 +37,10 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from docling_dev.api import router as converter_router
+# Теневые LLM-подсказки по полям. Живут здесь же, потому что здесь уже есть и
+# llama-cpp, и файл модели, и жизненный цикл процесса (запуск по требованию,
+# выгрузка по простою) — второй такой рантайм в бэкенде пришлось бы кормить
+# теми же 2.3 ГБ и отдельно решать под Astra Linux.
 
 app = FastAPI(title="PDF → Word конвертер (локальный)")
 
