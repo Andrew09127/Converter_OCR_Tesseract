@@ -60,6 +60,10 @@ _SCAN_LOCK = threading.Lock()
 _OCR_READER: list = []          # [reader] или [] ; None-маркер недоступности — [None]
 _OCR_READER_LOCK = threading.Lock()
 
+# Готовность движка. Импорт docling с torch занимает 15-40 с, и раньше он
+# приходился на первую конвертацию — уже после того, как /health сказал «готов».
+_ENGINE_READY = threading.Event()
+
 
 def _set(job_id: str, **changes) -> None:
     """Атомарно обновить запись задачи."""
@@ -77,7 +81,30 @@ def _get_scan_converter(ocr_preprocess: bool):
             log.info("api: строю Docling-конвертер (ocr_preprocess=%s)", ocr_preprocess)
             conv = build_converter(ocr_preprocess=ocr_preprocess)
             _SCAN_CONVERTERS[ocr_preprocess] = conv
+    if not ocr_preprocess:
+        _ENGINE_READY.set()
     return conv
+
+
+def engine_ready() -> bool:
+    """Загружен ли docling. False — первая конвертация ещё подождёт импорт."""
+    return _ENGINE_READY.is_set()
+
+
+def start_warmup() -> None:
+    """Греет движок в фоне, не задерживая ответ сервера.
+
+    Вариант без предобработки: им идёт обычная конвертация скана, а
+    ocr_preprocess=True включают редко и вручную.
+    """
+    def греть():
+        try:
+            _get_scan_converter(False)
+            log.info("api: движок прогрет")
+        except Exception as exc:                     # noqa: BLE001
+            log.warning("api: прогрев не удался, движок построится при первой задаче: %s", exc)
+
+    threading.Thread(target=греть, name="warmup", daemon=True).start()
 
 
 def _get_ocr_reader():
@@ -164,6 +191,18 @@ def _accept_upload(file: UploadFile) -> tuple[str, Path, Path]:
 
 
 #Эндпоинты
+
+@router.post("/warmup")
+async def warmup():
+    """Построить движок и дождаться готовности.
+
+    Нужен, когда прогрев при старте выключен (CONVERTER_WARMUP=0), а хозяин
+    процесса решил, что момент подходящий.
+    """
+    import asyncio
+    await asyncio.get_running_loop().run_in_executor(None, _get_scan_converter, False)
+    return {"ok": True, "converter_ready": engine_ready()}
+
 
 @router.post("/analyze")
 async def analyze_pdf(file: UploadFile = File(...)):

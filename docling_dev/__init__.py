@@ -1,13 +1,32 @@
-"""docling_dev — модульный конвертер отсканированных PDF → DOCX."""
-from .converter import convert_pdf, DoclingBatchConverter
-from .pipeline import build_converter
-from .doc_type import detect_doc_type, DOC_LEGAL, DOC_GENERIC
-from .page_analyser import analyse_pages, PageInfo
-from .renderer import render_document
+"""docling_dev — модульный конвертер отсканированных PDF → DOCX.
 
-__all__ = [
-    "convert_pdf", "DoclingBatchConverter", "build_converter",
-    "detect_doc_type", "DOC_LEGAL", "DOC_GENERIC",
-    "analyse_pages", "PageInfo",
-    "render_document",
-]
+Имена отдаются лениво (PEP 562): импорт любого из них тянет docling с torch,
+а это 15-40 с. Раньше за них платил каждый, кто просто поднимал сервер —
+`from docling_dev.api import router` исполнял этот модуль целиком.
+"""
+
+_ОТКУДА = {
+    "convert_pdf": ".converter",
+    "DoclingBatchConverter": ".converter",
+    "build_converter": ".pipeline",
+    "detect_doc_type": ".doc_type",
+    "DOC_LEGAL": ".doc_type",
+    "DOC_GENERIC": ".doc_type",
+    "analyse_pages": ".page_analyser",
+    "PageInfo": ".page_analyser",
+    "render_document": ".renderer",
+}
+
+__all__ = list(_ОТКУДА)
+
+
+def __getattr__(name: str):
+    module = _ОТКУДА.get(name)
+    if module is None:
+        raise AttributeError("module %r has no attribute %r" % (__name__, name))
+    from importlib import import_module
+    return getattr(import_module(module, __name__), name)
+
+
+def __dir__():
+    return sorted(__all__)

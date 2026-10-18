@@ -14,6 +14,7 @@ main.py
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -36,7 +37,7 @@ _HERE = Path(__file__).parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from docling_dev.api import router as converter_router
+from docling_dev.api import router as converter_router, engine_ready, start_warmup
 # Теневые LLM-подсказки по полям. Живут здесь же, потому что здесь уже есть и
 # llama-cpp, и файл модели, и жизненный цикл процесса (запуск по требованию,
 # выгрузка по простою) — второй такой рантайм в бэкенде пришлось бы кормить
@@ -56,9 +57,22 @@ app.add_middleware(
 app.include_router(converter_router)
 
 
+@app.on_event("startup")
+async def _warmup() -> None:
+    """Движок грузится сразу, а не при первой конвертации: импорт docling
+    с torch занимает 15-40 с, и раньше это ожидание доставалось пользователю
+    уже после того, как интерфейс отрапортовал о готовности.
+
+    CONVERTER_WARMUP=0 возвращает прежнее поведение: на машине, где память
+    дороже секунд, движок строится по первой задаче.
+    """
+    if os.environ.get("CONVERTER_WARMUP", "1") != "0":
+        start_warmup()
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "converter_ready": engine_ready()}
 
 
 # Если фронт уже собран (frontend/dist) — раздаём его статикой по корню,
