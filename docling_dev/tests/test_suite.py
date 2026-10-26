@@ -1550,3 +1550,114 @@ def test_corner_not_detected_scattered_right():
         + [_zone_entry(x0, x1, 100 + i * 15, f"п{i}") for i, (x0, x1) in enumerate(xs)]
     )
     assert _detect_corner_letterhead(zone, _bbox_ns(120, 190), pw) is None
+
+
+#  LLM-ДООЧИСТКА: ПРЕФИЛЬТР И ДЕДУПЛИКАЦИЯ ЗАПРОСОВ (п.1.3)
+
+from docling_dev import llm_correct as lcor
+
+
+class _FakeRun:
+    """Минимальный заменитель docx-run: текст + подсветка."""
+
+    def __init__(self, text, highlighted=True):
+        self.text = text
+        self.font = types.SimpleNamespace(
+            highlight_color=(lcor.WD_COLOR_INDEX.YELLOW if highlighted else None))
+
+
+class _FakePara:
+    def __init__(self, runs):
+        self.runs = runs
+
+    @property
+    def text(self):
+        return " ".join(r.text for r in self.runs)
+
+
+def _run_correct(monkeypatch, paras, answers):
+    """Прогон correct_highlighted на подставной модели. Возвращает
+    (сколько исправлено, список слов, про которые СПРОСИЛИ модель)."""
+    asked: list[str] = []
+
+    def fake_ask(llm, word, ctx):
+        asked.append(word)
+        return answers.get(word)
+
+    monkeypatch.setattr(lcor, "_resolve_model", lambda p: "fake.gguf")
+    monkeypatch.setattr(lcor, "_get_llm", lambda p: object())
+    monkeypatch.setattr(lcor, "_ask", fake_ask)
+    monkeypatch.setattr(lcor, "_iter_paragraphs", lambda doc: paras)
+    fixed = lcor.correct_highlighted(object())
+    return fixed, asked
+
+
+@pytest.mark.parametrize("word,expected", [
+    ("Крецитного", True),       # кириллица с ошибкой — спрашиваем
+    ("требованияNе", True),     # смешанные скрипты, но кириллица есть
+    ("wlw", False),             # нет кириллицы — правка всё равно не пройдёт
+    ("123", False),             # почти-цифровой токен
+    ("10-11", False),
+    ("XVII", False),            # римские цифры
+    ("", False),
+])
+def test_llm_prefilter(word, expected):
+    assert lcor._prefilter(word) is expected
+
+
+def test_llm_prefilter_matches_accept():
+    """Префильтр не должен отсекать то, что `_accept` принял бы: иначе экономия
+    запросов превратится в потерю правок."""
+    for orig, cand in [("Крецитного", "кредитного"), ("пО", "по"),
+                       ("оH", "он"), ("требованияNе", "требования №")]:
+        assert lcor._prefilter(orig), orig
+        assert lcor._accept(orig, cand) == cand
+
+
+def test_llm_skips_requests_for_prefiltered(monkeypatch):
+    """Про латиницу, числа и римские цифры модель не спрашивают вообще."""
+    paras = [_FakePara([_FakeRun("wlw"), _FakeRun("XVII"), _FakeRun("42"),
+                        _FakeRun("Крецитного")])]
+    fixed, asked = _run_correct(monkeypatch, paras, {"Крецитного": "кредитного"})
+    assert asked == ["Крецитного"]
+    assert fixed == 1
+    assert paras[0].runs[-1].text == "кредитного"
+    assert paras[0].runs[-1].font.highlight_color is None
+
+
+def test_llm_deduplicates_repeated_token(monkeypatch):
+    """Повторяющийся искажённый токен — один запрос, правка во всех вхождениях."""
+    runs = [_FakeRun("пО"), _FakeRun("пО"), _FakeRun("пО")]
+    paras = [_FakePara([runs[0]]), _FakePara(runs[1:])]
+    fixed, asked = _run_correct(monkeypatch, paras, {"пО": "по"})
+    assert asked == ["пО"]                  # спросили ровно один раз
+    assert fixed == 3                       # исправили все три вхождения
+    assert all(r.text == "по" for r in runs)
+
+
+def test_llm_dedup_remembers_refusal(monkeypatch):
+    """Отказ модели тоже кэшируется — повторно не спрашиваем."""
+    runs = [_FakeRun("бессмыслица"), _FakeRun("бессмыслица")]
+    paras = [_FakePara(runs)]
+    fixed, asked = _run_correct(monkeypatch, paras, {"бессмыслица": None})
+    assert asked == ["бессмыслица"]
+    assert fixed == 0
+    assert all(r.font.highlight_color == lcor.WD_COLOR_INDEX.YELLOW for r in runs)
+
+
+def test_llm_ignores_unhighlighted(monkeypatch):
+    paras = [_FakePara([_FakeRun("Крецитного", highlighted=False)])]
+    fixed, asked = _run_correct(monkeypatch, paras, {"Крецитного": "кредитного"})
+    assert (fixed, asked) == (0, [])
+
+
+def test_llm_env_int_fallback(monkeypatch):
+    """Мусор в переменной окружения не должен ломать запуск конвертера."""
+    monkeypatch.setenv("CONVERTER_LLM_TEST", "nonsense")
+    assert lcor._env_int("CONVERTER_LLM_TEST", 600) == 600
+    monkeypatch.setenv("CONVERTER_LLM_TEST", "0")
+    assert lcor._env_int("CONVERTER_LLM_TEST", 600) == 600
+    monkeypatch.setenv("CONVERTER_LLM_TEST", "8")
+    assert lcor._env_int("CONVERTER_LLM_TEST", 600) == 8
+    monkeypatch.delenv("CONVERTER_LLM_TEST")
+    assert lcor._env_int("CONVERTER_LLM_TEST", None) is None

@@ -33,6 +33,31 @@ _DEFAULT_MODEL = os.path.join(
     "models", "qwen2.5-1.5b-instruct-q4_k_m.gguf",
 )
 
+# Настройки стоимости LLM-доочистки (см. handoff.md, правка п.1.3):
+#   CONVERTER_LLM_THREADS — потоки префилла. Тяжёлый префилл идёт по
+#     n_threads_batch, а llama-cpp по умолчанию берёт cpu_count() (все ядра,
+#     включая логические). Замер: 16 → 5.1 s / 70 CPU-с, 8 → 7.3 s / 57,
+#     4 → 13.0 s / 50. Дефолт оставлен прежним: это ручка для слабых ПК.
+#   CONVERTER_LLM_UNLOAD — выгружать модель после документа. Освобождает ~2.2 ГБ
+#     RSS, но возвращает ~70 CPU-с префилла префикса на каждый документ, поэтому
+#     по умолчанию выключено (в сервере модель живёт долго).
+#   CONVERTER_LLM_CTX — сколько символов контекста уходит в запрос.
+def _env_int(name: str, default: int | None) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        log.warning("LLM: %s=%r — не целое число, беру значение по умолчанию", name, raw)
+        return default
+    return v if v > 0 else default
+
+
+_THREADS_BATCH = _env_int("CONVERTER_LLM_THREADS", None)
+_UNLOAD_AFTER  = os.environ.get("CONVERTER_LLM_UNLOAD", "").strip() in ("1", "true", "yes")
+_CTX_CHARS     = _env_int("CONVERTER_LLM_CTX", 600) or 600
+
 _DIGIT_RE    = re.compile(r"\d")
 _DIGIT_ONLY  = re.compile(r"^\d[\d\s.,\-/]*$")   # токен почти целиком из цифр
 _HAS_CYR     = re.compile(r"[А-Яа-яЁё]")
@@ -150,8 +175,10 @@ def _get_llm(model_path: str):
     if _llm is None and not _llm_failed:
         try:
             from llama_cpp import Llama
+            threads = _THREADS_BATCH or os.cpu_count() or 4
             _llm = Llama(model_path=model_path, n_ctx=2048,
-                         n_threads=os.cpu_count() or 4, verbose=False)
+                         n_threads=threads, n_threads_batch=threads,
+                         verbose=False)
             log.info("LLM: модель загружена (%s)", os.path.basename(model_path))
         except Exception as exc:
             _llm_failed = True
@@ -166,7 +193,7 @@ def _ask(llm, word: str, ctx: str) -> str | None:
             msgs.append({"role": "user", "content": u})
             msgs.append({"role": "assistant", "content": a})
         msgs.append({"role": "user", "content":
-                     f"Предложение: «{ctx[:300]}»\n"
+                     f"Предложение: «{ctx}»\n"
                      f"Искажённый фрагмент: «{word}»\nИсправление:"})
         out = llm.create_chat_completion(messages=msgs, temperature=0.0,
                                          max_tokens=16)
@@ -193,6 +220,24 @@ def _edit_distance(a: str, b: str) -> int:
     return prev[-1]
 
 
+def _prefilter(orig: str) -> bool:
+    """Можно ли вообще получить принимаемую правку для этого токена.
+
+    Те же запреты, что в `_accept`, но зависящие ТОЛЬКО от исходного слова —
+    значит проверяются ДО запроса к модели. Запрос к 1.5B стоит 0.4-0.7 s и
+    6-9 CPU-с, поэтому не спрашиваем про то, что отвергнем при любом ответе.
+    """
+    if not orig:
+        return False
+    if _ROMAN_RE.match(orig):
+        return False                         # римские цифры - не трогаем
+    if _DIGIT_ONLY.match(orig):
+        return False                         # почти-цифровой токен (42, 3.5, 10-11)
+    if not _HAS_CYR.search(orig):
+        return False                         # нет кириллицы в исходнике - не правим
+    return True
+
+
 def _accept(orig: str, cand: str | None) -> str | None:
     """Предохранители: принимаем правку, только если она безопасна и МЕЛКАЯ."""
     if not cand:
@@ -200,12 +245,8 @@ def _accept(orig: str, cand: str | None) -> str | None:
     cand = cand.splitlines()[0].strip().strip("«»\"'.,;:()")
     if not cand or cand == orig:
         return None
-    if _ROMAN_RE.match(orig):
-        return None                          # римские цифры — не трогаем
-    if _DIGIT_ONLY.match(orig):
-        return None                          # почти-цифровой токен (42, 3.5, 10-11) — не трогаем
-    if not _HAS_CYR.search(orig):
-        return None                          # нет кириллицы в исходнике — не правим
+    if not _prefilter(orig):
+        return None                          # римские/цифровые/без кириллицы
     if "\t" in cand or len(cand.split()) > 3:  # допускаем 1–3 слова (требования №)
         return None
     if _digits(cand) != _digits(orig):       # цифры менять запрещено
@@ -238,13 +279,15 @@ def correct_highlighted(doc, model_path: str | None = None) -> int:
     para_texts = [p.text for p in all_paras]
 
     fixed = 0
+    asked = reused = prefiltered = 0
+    answers: dict[str, str | None] = {}      # кэш ответов модели в пределах документа
     for idx, para in enumerate(all_paras):
         # «Оконный» контекст: текущий абзац + соседние (по 1 с каждой стороны).
-        # Маленькая модель (1.5B, n_ctx=512) — ограничиваем 600 символов итого.
+        # Маленькая модель (1.5B) — ограничиваем длиной _CTX_CHARS (CONVERTER_LLM_CTX).
         prev_txt = para_texts[idx - 1][:150] if idx > 0 else ""
         next_txt = para_texts[idx + 1][:150] if idx + 1 < len(all_paras) else ""
         ctx_window = " … ".join(t for t in [prev_txt, para.text, next_txt] if t)
-        ctx = ctx_window[:600]
+        ctx = ctx_window[:_CTX_CHARS]
 
         for run in para.runs:
             if run.font.highlight_color != WD_COLOR_INDEX.YELLOW:
@@ -252,11 +295,30 @@ def correct_highlighted(doc, model_path: str | None = None) -> int:
             word = run.text.strip()
             if not word:
                 continue
-            cand = _accept(word, _ask(llm, word, ctx))
+            if not _prefilter(word):
+                prefiltered += 1
+                continue
+            if word in answers:
+                # Один и тот же искажённый токен («пО», «оH») встречается в
+                # документе многократно, а правка для него от контекста не
+                # зависит: ответ модели переиспользуем, предохранители
+                # `_accept` всё равно прогоняются на каждом вхождении.
+                raw = answers[word]
+                reused += 1
+            else:
+                raw = _ask(llm, word, ctx)
+                answers[word] = raw
+                asked += 1
+            cand = _accept(word, raw)
             if cand:
                 run.text = run.text.replace(word, cand)
                 run.font.highlight_color = None
                 fixed += 1
                 log.info("LLM: %r → %r", word, cand)
-    log.info("LLM-доочистка: исправлено %d фрагментов", fixed)
+    log.info("LLM-доочистка: исправлено %d фрагментов; запросов к модели %d "
+             "(переиспользовано ответов %d, отсеяно до запроса %d)",
+             fixed, asked, reused, prefiltered)
+    if _UNLOAD_AFTER:
+        _cleanup_llm()
+        log.info("LLM: модель выгружена (CONVERTER_LLM_UNLOAD)")
     return fixed
