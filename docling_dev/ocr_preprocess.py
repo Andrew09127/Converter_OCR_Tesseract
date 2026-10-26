@@ -110,6 +110,69 @@ def _find_stamp_frames(labels, stats, n, mh, W, H,
     return frames
 
 
+# Предел доли чернил страницы, которую разрешено унести правилу «вне текстовых
+# строк». Замер по 32 страницам датасета: срезка 29 страниц ≤8.6% (обычно ≤3%),
+# законные выбросы 11.9–14% (удалена реальная грязь, слов стало больше), и одна
+# катастрофа — 61% (строки не собрались, под нож ушёл основной текст: OCR давал
+# 332 слова, после чистки 160). Порог 25% ловит катастрофу и не трогает законные
+# случаи. Точные правила (штамп, спеки, кромка) этим порогом НЕ ограничиваются:
+# они ограничены по площади, и на законно грязной странице должны работать.
+MAX_INK_CUT = 0.25
+
+# Зональный предохранитель: ширина зоны как доля листа и минимум буквоподобных
+# компонент в ней, при которых зона считается текстовой строкой, а не грязью.
+_RESCUE_ZONE_W_FRAC = 0.5
+_RESCUE_MIN_LETTERS = 8
+
+
+def _rescue_text_zones(labels, stats, cents, cand_ids, mh, W, kx) -> set[int]:
+    """Отменяет удаление компонент, которые вместе образуют ТЕКСТОВУЮ СТРОКУ.
+
+    Нужно для случая, когда детектор строк строку не поймал (например заголовок
+    внизу листа, слипшийся с рукописными росчерками: замер на `A53-9758` стр.1 —
+    удалялась зона 1289x207 px, 73% ширины листа, вместе с заголовком «Заявление
+    должника о признании несостоятельным (банкротом)»).
+
+    Кандидаты на удаление склеиваются той же горизонтальной дилатацией, что и
+    строки; если получившаяся зона ШИРОКАЯ (>=50% листа) и содержит много
+    компонент БУКВЕННОЙ высоты (>=8), это строка — её буквы оставляем. Росчерки,
+    пятна и спеки в той же зоне буквенного фильтра не проходят и удаляются
+    по-прежнему.
+    """
+    if not cand_ids:
+        return set()
+    cand = np.isin(labels, np.asarray(cand_ids)).astype(np.uint8)
+    zones = cv2.dilate(cand, np.ones((1, kx), np.uint8))
+    zn, zlabels, zstats, _ = cv2.connectedComponentsWithStats(zones, 8)
+    if zn <= 1:
+        return set()
+
+    by_zone: dict[int, list[int]] = {}
+    for i in cand_ids:
+        h = float(stats[i, cv2.CC_STAT_HEIGHT])
+        w = float(stats[i, cv2.CC_STAT_WIDTH])
+        if not (0.5 * mh <= h <= 1.5 * mh and w >= max(2.0, 0.1 * mh)):
+            continue                      # не буква: росчерк, клякса, спек, линия
+        cy, cx = int(round(cents[i][1])), int(round(cents[i][0]))
+        cy = min(max(cy, 0), zlabels.shape[0] - 1)
+        cx = min(max(cx, 0), zlabels.shape[1] - 1)
+        z = int(zlabels[cy, cx])
+        if z <= 0:
+            continue
+        by_zone.setdefault(z, []).append(i)
+
+    rescued: set[int] = set()
+    for z, ids in by_zone.items():
+        if (zstats[z, cv2.CC_STAT_WIDTH] >= _RESCUE_ZONE_W_FRAC * W
+                and len(ids) >= _RESCUE_MIN_LETTERS):
+            rescued.update(ids)
+            log.info("ocr_preprocess: зона %dx%d px — это текстовая строка "
+                     "(%d буквенных компонент), удаление отменено",
+                     zstats[z, cv2.CC_STAT_WIDTH], zstats[z, cv2.CC_STAT_HEIGHT],
+                     len(ids))
+    return rescued
+
+
 def remove_stains(gray):
     """Удаляет со скана всё, что не является текстом: грязь копира, полосы от
     сшивки, чёрные края, россыпь точек.
@@ -131,7 +194,7 @@ def remove_stains(gray):
     H, W = gray.shape[:2]
     thr = cv2.threshold(gray, 0, 255,
                         cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-    n, labels, stats, _cents = cv2.connectedComponentsWithStats(thr, 8)
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(thr, 8)
     if n <= 1:
         return gray
 
@@ -296,7 +359,8 @@ def remove_stains(gray):
         return False
 
     remove_ids = []
-    for i in range(1, n):
+    off_row_ids: list[int] = []     # удалённые правилом «вне строк» — только они
+    for i in range(1, n):           # подлежат зональному спасению (см. ниже)
         x = stats[i, cv2.CC_STAT_LEFT];  y = stats[i, cv2.CC_STAT_TOP]
         w = stats[i, cv2.CC_STAT_WIDTH]; h = stats[i, cv2.CC_STAT_HEIGHT]
         area    = float(stats[i, cv2.CC_STAT_AREA])
@@ -338,6 +402,36 @@ def remove_stains(gray):
             sub_lab  = labels[y:y + h, x:x + w]
             if not np.any(sub_rows[sub_lab == i]) and not _near_row(x, y, w, h):
                 remove_ids.append(i)
+                off_row_ids.append(i)
+
+    # Зональный предохранитель: кандидаты, которые вместе образуют широкую
+    # строку из буквенных компонент, — это текст, не поймавшийся детектором
+    # строк. Оставляем их (росчерки/пятна той же зоны удаляются по-прежнему).
+    if off_row_ids:
+        rescued = _rescue_text_zones(labels, stats, cents, off_row_ids, mh, W, kx)
+        if rescued:
+            remove_ids = [i for i in remove_ids if i not in rescued]
+            off_row_ids = [i for i in off_row_ids if i not in rescued]
+
+    # Постраничный предохранитель на правило «вне строк» — именно оно ошибается
+    # катастрофически, когда строки не собрались (замер: `Умерший ким клим`
+    # стр.1 — 61% чернил листа под нож, OCR 332 слова → 160). Точные правила
+    # (штамп, спеки, кромка) не отменяем: они ограничены по площади и на законно
+    # грязной странице должны работать.
+    if off_row_ids:
+        ink_total = int((thr > 0).sum())
+        off_ink = int(np.isin(labels, np.asarray(off_row_ids)).sum())
+        log.debug("ocr_preprocess: правило «вне строк» уносит %.1f%% чернил "
+                  "(%d компонент, порог %.0f%%)",
+                  off_ink / max(ink_total, 1) * 100, len(off_row_ids),
+                  MAX_INK_CUT * 100)
+        if ink_total and off_ink / ink_total > MAX_INK_CUT:
+            log.warning("ocr_preprocess: правило «вне строк» уносит %.0f%% чернил "
+                        "страницы (порог %.0f%%) — страница не похожа на грязную, "
+                        "правило отключено для неё", off_ink / ink_total * 100,
+                        MAX_INK_CUT * 100)
+            drop = set(off_row_ids)
+            remove_ids = [i for i in remove_ids if i not in drop]
 
     if not remove_ids:
         return gray
@@ -347,8 +441,12 @@ def remove_stains(gray):
     rm_mask = cv2.dilate(rm_mask, np.ones((5, 5), np.uint8))
     cleaned = gray.copy()
     cleaned[rm_mask.astype(bool)] = 255
-    log.debug("ocr_preprocess: удалено пятен/точек: %d (median_h=%.0fpx)",
-              len(remove_ids), mh)
+
+    ink_before = int((gray < 160).sum())
+    ink_after  = int((cleaned < 160).sum())
+    cut = (ink_before - ink_after) / max(ink_before, 1)
+    log.debug("ocr_preprocess: удалено пятен/точек: %d (median_h=%.0fpx, "
+              "срезано %.1f%% чернил)", len(remove_ids), mh, cut * 100)
     return cleaned
 
 
