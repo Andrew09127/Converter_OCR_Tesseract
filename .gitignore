@@ -34,6 +34,8 @@ env/
 .claude/
 /CLAUDE.md
 /handoff.md
+/plan_optimization.md
+/plan_phases.md
 
 
 # dev-инструменты вёрстки (не коммитим)
