@@ -2461,3 +2461,24 @@ def test_parallel_ocr_batch_size_follows_workers():
     src = inspect.getsource(pipeline.build_converter)
     assert "pipeline_opts.ocr_batch_size" in src
     assert "resolve_workers" in src
+
+def test_layout_and_table_batch_are_one():
+    """Батч разметки и таблиц — 1 (п.2.2). Замерено: батч 4 стоит 801 МБ пика и
+    12 s времени при идентичном результате, и весь эффект даёт РАЗМЕТКА. Поднять
+    обратно — значит вернуть эту цену, поэтому значение закреплено тестом."""
+    import inspect
+    from docling_dev import pipeline
+    src = inspect.getsource(pipeline.build_converter)
+    assert "pipeline_opts.layout_batch_size" in src
+    assert "pipeline_opts.table_batch_size" in src
+    opts = _built_pipeline_opts()
+    assert (opts.layout_batch_size, opts.table_batch_size) == (1, 1)
+
+
+def _built_pipeline_opts():
+    """Опции конвейера из настоящего build_converter — проверяем значения, а не
+    только текст исходника."""
+    from docling.datamodel.base_models import InputFormat
+    from docling_dev import build_converter
+    conv = build_converter(ocr_preprocess=False)
+    return conv.format_to_options[InputFormat.PDF].pipeline_options
