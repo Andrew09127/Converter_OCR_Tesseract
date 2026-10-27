@@ -8,6 +8,8 @@ tests/run_phase.py
   1. pytest docling_dev/tests/   — юнит-тесты (быстро, всегда);
   2. tests/smoke_env.py          — готовность окружения;
   3. tests/quality.py check      — снимок качества (регресс текста/структуры);
+  4. tests/highlights.py check   — точность подсветки по локальной разметке
+                                   (пропускается, если разметки нет);
   4. tests/perf.py check         — снимок скорости и ресурсов;
   5. tests/golden.py check       — эталоны вёрстки (информативно: эталоны
                                    устарели из-за дрейфа OCR с июля, их
@@ -38,10 +40,10 @@ PY = sys.executable
 # golden везде информативен: его эталоны устарели (см. handoff.md).
 PHASE_CHECKS: dict[int, tuple[str, ...]] = {
     0: ("pytest", "env"),
-    1: ("pytest", "env", "quality", "perf"),
+    1: ("pytest", "env", "quality", "highlights", "perf"),
     2: ("pytest", "env", "quality", "perf"),
     3: ("pytest", "env", "perf", "quality"),
-    4: ("pytest", "env", "quality"),
+    4: ("pytest", "env", "quality", "highlights"),
 }
 
 
@@ -77,6 +79,9 @@ def main() -> int:
     if "quality" in checks:
         plan.append(("качество (quality check)",
                      [PY, "tests/quality.py", "check", "--groups", args.groups], True))
+    if "highlights" in checks:
+        plan.append(("точность подсветки (highlights check)",
+                     [PY, "tests/highlights.py", "check"], True))
     if "perf" in checks:
         plan.append(("скорость и ресурсы (perf check)",
                      [PY, "tests/perf.py", "check", "--groups", args.groups], True))

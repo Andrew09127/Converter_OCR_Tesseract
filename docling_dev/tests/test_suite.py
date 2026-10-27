@@ -1784,3 +1784,154 @@ def test_osd_no_dpi_stamp_left():
     assert not hasattr(ocr_osd, "_stamp_dpi")
     from docling_dev import ocr_preprocess as opre_mod
     assert not hasattr(opre_mod, "_save_page")
+
+
+#  ТОЧНОСТЬ ПОДСВЕТКИ: ДОКУМЕНТНЫЕ ПРАВИЛА (п.1.4)
+
+from docling_dev.highlight import build_doc_context as _bdc
+from docling_dev.highlight import _is_suspicious as _susp
+
+
+def _flagged(word, texts):
+    """Подозрительно ли слово с учётом контекста документа."""
+    return _susp(word, _bdc(texts))
+
+
+def test_hl_org_in_quotes_not_flagged():
+    """Название в кавычках — не ошибка, даже если словарь его не знает."""
+    texts = ["Кредитор 1. ООО МКК «Зайцеборг» предоставил заём должнику."]
+    assert _susp("Зайцеборг") is True          # без контекста — подозрительно
+    assert _flagged("Зайцеборг", texts) is False
+
+
+def test_hl_org_after_legal_form_not_flagged():
+    """Организация без кавычек, но после правовой формы: «АО МКК Зайцеборг»."""
+    texts = ["АО МКК Зайцеборг — 7500,00 руб.", "АО МКК Зайцеборг включено в реестр."]
+    assert _flagged("Зайцеборг", texts) is False
+
+
+def test_hl_toponym_needs_second_mention():
+    """Маркер «ул.» сам по себе ничего не доказывает: «ул. Барданиул» и
+    «ул. Кленцовская» выглядят одинаково. Доказательство — повторное упоминание."""
+    once = ["Адрес: 344019, г. Ростов-на-Дону, ул. Кленцовская, 23"]
+    twice = once + ["Корреспонденция: ул. Кленцовская, 23, второй этаж"]
+    assert _flagged("Кленцовская", once) is True
+    assert _flagged("Кленцовская", twice) is False
+
+
+def test_hl_surname_near_patronymic():
+    """Фамилия рядом с отчеством — через имя, поэтому окно шире одного слова."""
+    texts = ["Признать гражданина Зайцеборгова Петра Аркадьевича несостоятельным.",
+             "Зайцеборгова Петра Аркадьевича включить в реестр."]
+    assert _flagged("Зайцеборгова", texts) is False
+
+
+def test_hl_twin_pair_both_flagged():
+    """Если в документе есть почти такой же токен, направление ошибки неизвестно —
+    подсвечиваем ОБА: пропустить искажённое имя кредитора хуже, чем шум."""
+    texts = ["Кредитор ООО МКК «Зайцеборг» включён в реестр.",
+             "Требование ООО МКК «Займеборг» подтверждено."]
+    assert _flagged("Зайцеборг", texts) is True
+    assert _flagged("Займеборг", texts) is True
+
+
+def test_hl_ii_tail_never_excused():
+    """«й» прочитана как «и» («Ростовскои») — не извиняется никаким правилом."""
+    texts = ["Решение Арбитражного суда Ростовскои области от 03.03.2026",
+             "по делу Ростовскои области, город Ростов-на-Дону"]
+    assert _flagged("Ростовскои", texts) is True
+
+
+def test_hl_inner_junk_never_excused():
+    """Склейка через мусорный символ («обл„Шахты») — дефект, а не имя."""
+    texts = ["Место рождения: Ростовская обл„Шахты, паспорт выдан",
+             "обл„Шахты указана в заявлении"]
+    assert _flagged("обл„Шахты", texts) is True
+
+
+def test_hl_url_without_dots():
+    """OCR теряет точки в адресе: «www nalog gov ru» — это адрес, а не ошибки."""
+    texts = ["Телефон (8639) 22-27-32 www nalog gov ru"]
+    assert _flagged("nalog", texts) is False
+    assert _flagged("gov", texts) is False
+
+
+def test_hl_latin_brand_in_parens():
+    """Латинское название в скобках: «ООО МКК «УФ» (Fast Cash Money)»."""
+    texts = ["6. ООО МКК «УФ» (Fast Cash Money)"]
+    assert _flagged("Fast", texts) is False
+    assert _flagged("Cash", texts) is False
+
+
+def test_hl_latin_junk_still_flagged():
+    """А латинский обрывок сам по себе — мусор OCR, подсветка остаётся."""
+    texts = ["Зайцеборгова Петра Аркадьевича MHI признать банкротом"]
+    assert _flagged("MHI", texts) is True
+
+
+def test_hl_hyphen_parts_known():
+    """Склейка двух словарных слов через дефис — не ошибка."""
+    assert _susp("купли-продажи") is False
+    assert _susp("гражданина-должника") is False
+
+
+def test_hl_repeat_excused_only_without_near_word():
+    """Повтор извиняет токен, ТОЛЬКО если в документе нет похожего словарного
+    слова: иначе это систематическая ошибка OCR, а не имя."""
+    name = ["Членом СРО ААУ Зайцеборгск является управляющий.",
+            "СРО ААУ Зайцеборгск подтвердило согласие."]
+    systematic = ["Имеется росроченная задолженность по договору.",
+                  "Указанная росроченная задолженность не погашена.",
+                  "Просроченная задолженность подтверждена выпиской."]
+    assert _flagged("Зайцеборгск", name) is False
+    assert _flagged("росроченная", systematic) is True
+
+
+def test_hl_structural_rules_ignore_context():
+    """Смешанные алфавиты и капс в середине слова — безусловные признаки:
+    исключения к ним не применяются, даже если слово стоит в кавычках."""
+    texts = ["ООО МКК «Зaйцеборг» включено в реестр.",
+             "ООО МКК «Зaйцеборг» подтвердило требование."]
+    assert _flagged("Зaйцеборг", texts) is True        # «a» латинская
+
+
+def test_hl_doc_context_counts_all_forms():
+    """Словоформы одного имени считаются вместе: иначе каждая выглядит одиночной
+    и доказательств, что это имя, не набирается. Фамилия берётся вне словаря
+    pymorphy (ТЕСЁЛКИН), но с общей предсказанной начальной формой."""
+    texts = ["Признать ТЕСЁЛКИНУ МАРИЮ ПЕТРОВНУ банкротом.",
+             "По сведениям реестра ТЕСЁЛКИНОЙ МАРИИ ПЕТРОВНЫ открыто дело."]
+    ctx = _bdc(texts)
+    assert ctx.is_excused("ТЕСЁЛКИНУ") and ctx.is_excused("ТЕСЁЛКИНОЙ")
+    # Одно упоминание той же фамилии — исключение НЕ выдаётся.
+    assert _flagged("ТЕСЁЛКИНУ", texts[:1]) is True
+
+
+#  ПРЕДОХРАНИТЕЛЬ LLM: ПРАВКА ДОЛЖНА БЫТЬ СЛОВОМ (п.1.4)
+
+@pytest.mark.parametrize("orig,cand", [
+    ("Крецитного", "кредитного"),      # замеренные верные правки
+    ("сuuтветствии", "соответствии"),
+    ("задолженнобть", "задолженность"),
+    ("гофударственной", "государственной"),
+    ("Сберданк", "Сбербанк"),
+    ("обязательс", "обязательства"),
+    ("требованияNе", "требования №"),  # правка без кириллицы в части — пропускаем
+])
+def test_llm_accept_keeps_real_words(orig, cand):
+    assert lcor._accept(orig, cand) is not None
+
+
+@pytest.mark.parametrize("orig,cand", [
+    ("Задолженпость", "Задолжность"),   # замеренные НЕВЕРНЫЕ правки: не слова
+    ("пюридических", "правических"),
+    ("КАРАГЕЗОВОЙ", "Карагеевой"),
+    ("Должников", "Должнпков"),
+])
+def test_llm_accept_rejects_non_words(orig, cand):
+    assert lcor._accept(orig, cand) is None
+
+
+def test_llm_accept_allows_domain_terms():
+    """Доменные слова («взыскателя») словарю pymorphy неизвестны, но верны."""
+    assert lcor._accept("взыскагеля", "взыскателя") == "взыскателя"

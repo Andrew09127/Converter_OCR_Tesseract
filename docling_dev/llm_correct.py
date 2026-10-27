@@ -220,6 +220,40 @@ def _edit_distance(a: str, b: str) -> int:
     return prev[-1]
 
 
+_CYR_PART_RE = re.compile(r"[А-Яа-яЁё]{2,}")
+
+
+def _is_real_word(word: str) -> bool:
+    """Есть ли слово в словаре (pymorphy) или в доменном списке.
+
+    Без словаря всё считаем словом — иначе на машине без pymorphy доочистка
+    молча перестала бы работать.
+    """
+    try:
+        from .highlight import _domain_known, _pymorphy_known, _morph
+    except Exception:                        # noqa: BLE001
+        return True
+    if _morph is None:
+        return True
+    low = word.lower()
+    return _pymorphy_known(low) or _domain_known(low)
+
+
+def _result_is_words(cand: str) -> bool:
+    """Все кириллические части правки — существующие слова.
+
+    Главный предохранитель от «правок», которые портят текст: замер показал, что
+    модель 1.5B охотно выдаёт «Задолженпость» → «Задолжность», «пюридических» →
+    «правических», «КАРАГЕЗОВОЙ» → «Карагеевой». Все такие ответы — не слова, и
+    отличить их от верных правок («Крецитного» → «кредитного») можно словарём:
+    на 19 верных правках замера условие проходит целиком.
+    """
+    parts = _CYR_PART_RE.findall(cand)
+    if not parts:
+        return True                          # правка без кириллицы («№») — не нам судить
+    return all(_is_real_word(p) for p in parts)
+
+
 def _prefilter(orig: str) -> bool:
     """Можно ли вообще получить принимаемую правку для этого токена.
 
@@ -250,6 +284,8 @@ def _accept(orig: str, cand: str | None) -> str | None:
     if "\t" in cand or len(cand.split()) > 3:  # допускаем 1–3 слова (требования №)
         return None
     if _digits(cand) != _digits(orig):       # цифры менять запрещено
+        return None
+    if not _result_is_words(cand):           # правка должна быть словом, а не новым мусором
         return None
     # Для слов, содержащих цифры, порог жёстче: только 1 замена (очепятка рядом с числом)
     # Пример: «8I72361» содержит цифры, «Крецитного» — нет.

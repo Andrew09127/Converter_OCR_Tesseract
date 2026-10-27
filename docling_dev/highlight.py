@@ -79,6 +79,8 @@ _DOMAIN_OK_STEMS: tuple[str, ...] = (
     "созаёмщик", "созаемщик", "поручительств", "неустойк", "потребительск",
     "правоустанавлива", "правопреемник", "правопреемств", "реструктуризац",
     "досудебн", "внесудебн", "подведомственн", "подсудн",
+    # пополнение по разметке корпуса (п.1.4): верные слова, которых нет в pymorphy
+    "самозанят", "госрег",
 )
 
 
@@ -125,7 +127,269 @@ def _pymorphy_known(word: str) -> bool:
     return any(p.tag.POS not in (None, "UNKN") for p in parses)
 
 
-def _is_suspicious(core: str) -> bool:
+# ── Документные правила «это не ошибка» (п.1.4) ──────────────────────────────
+# Разметка корпуса (155 различных подсвеченных слов: 110 искажений, 45 верных)
+# показала, что ВСЕ ложные срабатывания дают только два правила — словарная
+# проверка и короткая латиница. Поэтому исключения применяются лишь к ним;
+# структурные признаки (смешанные алфавиты, капс в середине слова) безусловны.
+#
+# Исключения выводятся из самого документа, а не из рукописного списка компаний:
+# в корпусе каждая организация либо в кавычках, либо после правовой формы,
+# каждый топоним — рядом с «ул./город», каждая фамилия — рядом с отчеством или
+# инициалами. Список из двадцати названий пришлось бы вечно пополнять, а эти
+# правила переносятся на новые документы.
+_LEGAL_FORMS = {
+    "ооо", "оао", "зао", "пао", "ао", "нао", "ип", "мкк", "мфк", "мфо", "пко",
+    "пкб", "сро", "аау", "нпф", "кб", "бки", "тсж", "гуп", "муп", "фгуп",
+    "ано", "нко", "кпк", "скпк", "банк",
+}
+_GEO_MARKERS = {
+    "ул", "улица", "пер", "переулок", "просп", "проспект", "пр-кт", "пл",
+    "площадь", "б-р", "бульвар", "наб", "набережная", "ш", "шоссе", "мкр",
+    "микрорайон", "р-н", "район", "ст-ца", "станица", "г", "гор", "город",
+    "с", "село", "пос", "поселок", "посёлок", "х", "хутор", "д", "деревня",
+    "обл", "область", "край", "тер",
+}
+# Отчество опознаём по окончанию — это надёжнее любого словаря имён.
+_PATR_SUFFIXES = (
+    "ович", "овича", "овичу", "овичем", "овиче",
+    "евич", "евича", "евичу", "евичем", "евиче",
+    "ьевич", "ьевича", "ьевичу",
+    "овна", "овны", "овне", "овну", "овной",
+    "евна", "евны", "евне", "евну", "евной",
+    "ична", "ичны", "ичне", "ичну", "ичной",
+)
+_INITIALS_RE = re.compile(r"^[А-ЯЁ]\.(?:[А-ЯЁ]\.?)?$")
+_QUOTED_RE = re.compile("[«\"„]([^»\"“]{2,80})[»\"“]")
+_URL_FULL_RE = re.compile(
+    r"[\w.-]+@[\w.-]+|https?://\S+"
+    r"|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+",      # nalog.gov.ru, www.nalog.gov.Tu
+    re.IGNORECASE)
+# В скобках чисто латинская фраза — название бренда: «(One Click Money)».
+_LAT_PAREN_RE = re.compile(rf"\(\s*((?:[{_LAT}][{_LAT}0-9]*[ ,.&-]*){{2,6}})\)")
+_WORDISH_RE = re.compile(rf"[{_CYR}{_LAT}]{{2,}}")
+_NEAR_MAX_DIST = 2       # «росроченная» → «просроченная» = 1, «задолженнофть» = 1
+
+
+# Внутренняя грязь: кавычка, запятая, апостроф ВНУТРИ слова — дефект склейки
+# («РСФСР‚паспорт», «обл„Шахты»), никакое имя так не выглядит.
+_INNER_JUNK_RE = re.compile(r"[\w][«»„“”‚’'\",;:!?()\[\]{}/\\|<>*%#$^&~`+=][\w]")
+# «й» распознана как «и»: русских слов на «-ои»/«-еи» практически нет, а
+# «Ташкентскои», «Азовскии», «Россиискои» — типичная ошибка OCR.
+_II_TAIL_RE = re.compile(r"(?:ои|еи|ии)$", re.IGNORECASE)
+
+
+def _is_patronymic(token: str) -> bool:
+    low = token.lower()
+    return len(low) >= 6 and low.endswith(_PATR_SUFFIXES)
+
+
+@lru_cache(maxsize=20000)
+def _lemma(word: str) -> str:
+    """Начальная форма по pymorphy (для незнакомых слов — предсказанная).
+
+    Нужна, чтобы «КАРАГЕЗОВА», «КАРАГЕЗОВОЙ» и «КАРАГЕЗОВУ» считались одним
+    именем: иначе каждая словоформа выглядит одиночной и доказательств, что это
+    имя, не набирается.
+    """
+    if _morph is None:
+        return word.lower()
+    parses = _morph.parse(word.lower())
+    return parses[0].normal_form if parses else word.lower()
+
+
+def _edit_distance_le(a: str, b: str, limit: int) -> bool:
+    """Расстояние Левенштейна ≤ limit, с ранним выходом (вызывается часто)."""
+    if abs(len(a) - len(b)) > limit:
+        return False
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[-1] + 1, prev[j - 1] + (ca != cb)))
+        if min(cur) > limit:
+            return False
+        prev = cur
+    return prev[-1] <= limit
+
+
+def _hyphen_parts_known(core: str) -> bool:
+    """Составное слово, все части которого словарные: «купли-продажи».
+    pymorphy таких склеек не знает, хотя каждую половину знает."""
+    if "-" not in core:
+        return False
+    parts = [p for p in core.split("-") if len(p) >= 2]
+    if len(parts) < 2:
+        return False
+    return all(_pymorphy_known(p) or _ABBREV_RE.match(p) or _domain_known(p)
+               for p in parts)
+
+
+class DocContext:
+    """Сведения обо ВСЁМ документе: что в нём повторяется и что названо именем.
+
+    Нужен потому, что по одному слову фамилию от искажения не отличить: pymorphy
+    предсказывает метку `Surn` и для «Геворгян», и для «Россйн» (замерено). А вот
+    «встречается 6 раз и ни на одно словарное слово документа не похоже» —
+    признак имени, а не ошибки OCR, потому что ошибки OCR случайны.
+    """
+
+    __slots__ = ("counts", "excused", "vetoed")
+
+    def __init__(self, counts: dict, excused: dict, vetoed: dict | None = None):
+        self.counts = counts
+        self.excused = excused       # токен → имя правила, снявшего подозрение
+        self.vetoed = vetoed or {}   # токен → почему исключение не применилось
+
+    def is_excused(self, core: str) -> bool:
+        return core in self.excused
+
+    def reason(self, core: str) -> str:
+        return self.excused.get(core, "")
+
+
+def _doc_tokens(text: str) -> list:
+    return [t.strip(_STRIP) for t in text.split()]
+
+
+def build_doc_context(texts: list) -> DocContext:
+    """Собирает контекст документа по текстам абзацев (до правок подсветки)."""
+    counts: dict = {}
+    for text in texts:
+        for tok in _doc_tokens(text):
+            if tok:
+                counts[tok] = counts.get(tok, 0) + 1
+
+    # Токены, похожие друг на друга: «Коллекши» при наличии «Коллекшн»,
+    # «Руснитерфинанс» при «Русинтерфинанс», «Сберданк» при «Сбербанк» — это
+    # искажение имени, а не имя. Такое исключать нельзя, иначе проверяющий
+    # никогда не увидит, что фамилия кредитора написана с ошибкой.
+    def _twin_of(tok: str) -> str:
+        """Почти такой же токен документа с ДРУГОЙ леммой, если он есть.
+
+        Направление ошибки определить нельзя: «Коллекшн»/«Коллекши» и
+        «Русинтерфинанс»/«Руснитерфинанс» встречаются по одному разу, и ни одного
+        из них нет в словаре. Поэтому подсвечиваем ОБА — пусть проверяющий
+        сравнит сам: пропустить искажённое имя кредитора хуже, чем подсветить
+        верное.
+        """
+        low = tok.lower()
+        for other in counts:
+            if other == tok or len(other) < 4:
+                continue
+            ol = other.lower()
+            if ol == low or not _edit_distance_le(low, ol, _NEAR_MAX_DIST):
+                continue
+            if _lemma(ol) == _lemma(low):
+                continue                     # словоформы одного слова, не ошибка
+            # Двойник должен начинаться так же: иначе в двойники попадает любое
+            # случайно похожее слово («Займер» ↔ «размер» — расстояние 2).
+            if low[:3] != ol[:3]:
+                continue
+            # Если двойник ЕСТЬ В СЛОВАРЕ, он, скорее всего, обычное слово, а не
+            # искажение имени («Мирский» ↔ «мирской»): такой паре вето не нужно.
+            if _pymorphy_known(ol):
+                continue
+            return other
+        return ""
+
+    def _veto(token: str) -> str:
+        """Причина, по которой исключения не действуют ни по какому правилу."""
+        if _INNER_JUNK_RE.search(token):
+            return "склейка через мусорный символ"
+        if (_HAS_CYR.search(token) and not _pymorphy_known(token.lower())
+                and _II_TAIL_RE.search(token)):
+            return "окончание «-ои/-еи/-ии» (й прочитана как и)"
+        twin = _twin_of(token)
+        return f"есть почти такой же токен «{twin}»" if twin else ""
+
+    # Сколько раз документ называет это имя во ВСЕХ словоформах. Маркер рядом
+    # («ул.», «ООО», отчество) сам по себе ничего не доказывает: «ул. Барданиул»
+    # и «ул. Неглинная» для программы выглядят одинаково. А вот имя, названное
+    # в документе хотя бы дважды, — это имя: ошибки OCR не повторяются.
+    lemma_counts: dict = {}
+    for tok, n in counts.items():
+        if tok:
+            lem = _lemma(tok)
+            lemma_counts[lem] = lemma_counts.get(lem, 0) + n
+
+    def _named_twice(token: str) -> bool:
+        return lemma_counts.get(_lemma(token), 0) >= 2
+
+    excused: dict = {}
+    vetoed: dict = {}
+
+    def mark(token: str, rule: str) -> None:
+        if not token or token in excused:
+            return
+        why = _veto(token)
+        if why:
+            vetoed.setdefault(token, why)
+            return
+        excused[token] = rule
+
+    for text in texts:
+        # 1. Всё в кавычках — название: «Быстроденьги», «ДЗП-Единый», «Займер».
+        for m in _QUOTED_RE.finditer(text):
+            for t in _WORDISH_RE.findall(m.group(1)):
+                mark(t, "кавычки")
+        # 2. Куски URL и e-mail: nalog.gov.ru даёт токены nalog / gov / ru.
+        for m in _URL_FULL_RE.finditer(text):
+            for t in _WORDISH_RE.findall(m.group(0)):
+                mark(t, "url")
+        # 2а. Латинское название в скобках: «ООО МКК «УФ» (One Click Money)».
+        for m in _LAT_PAREN_RE.finditer(text):
+            for t in _WORDISH_RE.findall(m.group(1)):
+                mark(t, "латинское название")
+        # 3. Соседи маркеров: «ул. Неглинная», «АО МКК Займ-Экспресс»,
+        #    «КАРАГЕЗОВА ЛИЛИЯ АРКАДЬЕВНА» (у отчества и инициалов окно шире,
+        #    потому что фамилия стоит через имя).
+        toks = _doc_tokens(text)
+        # «www nalog gov ru» — точки потеряны при распознавании; всё латинское
+        # после «www» до первого кириллического слова принадлежит адресу.
+        for i, tok in enumerate(toks):
+            if tok.lower().strip(".") != "www":
+                continue
+            for nb in toks[i + 1:i + 5]:
+                if not nb or not _HAS_LAT.search(nb) or _HAS_CYR.search(nb):
+                    break
+                mark(nb, "url")
+        for i, tok in enumerate(toks):
+            low = tok.lower().rstrip(".")
+            if low in _GEO_MARKERS:
+                window, rule = 1, "топоним"
+            elif low in _LEGAL_FORMS:
+                window, rule = 1, "организация"
+            elif _is_patronymic(tok) or _INITIALS_RE.match(tok):
+                window, rule = 2, "фио"
+            else:
+                continue
+            for j in range(max(0, i - window), min(len(toks), i + window + 1)):
+                nb = toks[j]
+                # Только кириллица: латинский обрывок рядом с инициалами
+                # («MHI», «Kum») — мусор OCR, а не имя.
+                if (j != i and nb[:1].isupper() and _HAS_CYR.search(nb)
+                        and not _HAS_LAT.search(nb) and _named_twice(nb)):
+                    mark(nb, rule)
+
+    # 4. Повторяющийся токен — скорее имя, чем ошибка. Оговорка ОБЯЗАТЕЛЬНА:
+    #    если в документе есть ПОХОЖЕЕ словарное слово, это систематическая
+    #    ошибка OCR («росроченная» при наличии «просроченной», «задолженнофть»
+    #    при «задолженности»), и подсветку снимать нельзя.
+    known_doc = [t.lower() for t in counts
+                 if len(t) >= 5 and _pymorphy_known(t.lower())]
+    for tok, n in counts.items():
+        if n < 2 or len(tok) < 5 or tok in excused:
+            continue
+        low = tok.lower()
+        if _pymorphy_known(low):
+            continue
+        if not any(_edit_distance_le(low, kw, _NEAR_MAX_DIST) for kw in known_doc):
+            mark(tok, "повтор")
+    return DocContext(counts, excused, vetoed)
+
+
+def _is_suspicious(core: str, ctx=None) -> bool:
     if not core:
         return False
     if _HAS_DIGIT.search(core):
@@ -139,7 +403,8 @@ def _is_suspicious(core: str) -> bool:
         return True
     # 3) короткий (≤5 букв) чисто-латинский токен (гомоглиф среди кириллицы)
     if has_lat and not has_cyr and _PURE_LAT_SHORT.match(core):
-        return True
+        # кусок URL или латинское название («One Click Money») — не ошибка
+        return not (ctx and ctx.is_excused(core))
     # 1) капс в середине слова
     if has_cyr and _CAPS_MID_RE.fullmatch(core):
         return True
@@ -147,12 +412,16 @@ def _is_suspicious(core: str) -> bool:
     if has_cyr and not has_lat and len(core) >= 6 and not _ABBREV_RE.match(core):
         if _domain_known(core):
             return False                  # верный доменный термин — не шумим
+        if _hyphen_parts_known(core):
+            return False                  # «купли-продажи», «гражданина-должника»
+        if ctx is not None and ctx.is_excused(core):
+            return False                  # имя, организация, топоним или повтор
         if not _pymorphy_known(core):
             return True
     return False
 
 
-def suspicious_spans(text: str) -> list[tuple[int, int]]:
+def suspicious_spans(text: str, ctx=None) -> list[tuple[int, int]]:
     """Возвращает список (start, end) символьных диапазонов подозрительных слов."""
     spans: list[tuple[int, int]] = []
     for m in _TOKEN_RE.finditer(text):
@@ -161,7 +430,7 @@ def suspicious_spans(text: str) -> list[tuple[int, int]]:
         core = tok.strip(_STRIP)
         if not core:
             continue
-        if _is_suspicious(core):
+        if _is_suspicious(core, ctx):
             off = m.start() + tok.find(core)
             spans.append((off, off + len(core)))
     return spans
@@ -387,11 +656,11 @@ def _has_complex_content(r) -> bool:
     return False
 
 
-def _process_run(run) -> tuple[int, int]:
+def _process_run(run, ctx=None) -> tuple[int, int]:
     """Для каждого подозрительного слова: либо ДЕТЕРМИНИРОВАННО чиним (без
     подсветки), либо подсвечиваем жёлтым (если автопочинить нельзя).
     Возвращает (подсвечено, исправлено)."""
-    spans = suspicious_spans(run.text)
+    spans = suspicious_spans(run.text, ctx)
     if not spans or _has_complex_content(run._r):
         return (0, 0)
     text = run.text
@@ -430,13 +699,17 @@ def highlight_suspicious(doc) -> int:
     """Чистит детерминируемые OCR-ошибки в помеченных словах и подсвечивает
     остаток жёлтым. Возвращает число подсвеченных (оставшихся) фрагментов."""
     n_hl = n_fix = 0
-    for para in _iter_paragraphs(doc):
+    paras = list(_iter_paragraphs(doc))
+    # Контекст собираем ДО правок: тексты абзацев ещё исходные.
+    ctx = build_doc_context([p.text for p in paras])
+    for para in paras:
         for run in list(para.runs):
             try:
-                hl, fix = _process_run(run)
+                hl, fix = _process_run(run, ctx)
                 n_hl += hl; n_fix += fix
             except Exception as exc:               # один run не должен ломать документ
                 log.debug("highlight: пропуск run: %s", exc)
-    log.info("highlight: исправлено %d, подсвечено %d (осталось) фрагментов",
-             n_fix, n_hl)
+    log.info("highlight: исправлено %d, подсвечено %d (осталось) фрагментов; "
+             "снято с подозрения документными правилами: %d токенов",
+             n_fix, n_hl, len(ctx.excused))
     return n_hl
