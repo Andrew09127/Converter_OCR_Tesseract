@@ -157,6 +157,16 @@ def build_converter(
     except Exception as _exc:
         log.debug("ocr_preprocess недоступен: %s", _exc)
 
+    # OSD (ориентация страницы) — один процесс tesseract на документ вместо
+    # одного на страницу: 11% времени конвертации уходило на перепроверку одной
+    # и той же ориентации. Повёрнутые страницы при этом не ломаются — см.
+    # ocr_osd.install_osd_cache.
+    try:
+        from .ocr_osd import install_osd_cache
+        install_osd_cache()
+    except Exception as _exc:
+        log.debug("ocr_osd недоступен: %s", _exc)
+
     ocr_opts = _tesseract_options(langs)
 
     pipeline_opts = PdfPipelineOptions()

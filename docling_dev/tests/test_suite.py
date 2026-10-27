@@ -1661,3 +1661,126 @@ def test_llm_env_int_fallback(monkeypatch):
     assert lcor._env_int("CONVERTER_LLM_TEST", 600) == 8
     monkeypatch.delenv("CONVERTER_LLM_TEST")
     assert lcor._env_int("CONVERTER_LLM_TEST", None) is None
+
+
+#  OSD ОДИН РАЗ НА ДОКУМЕНТ (п.1.2)
+
+from docling_dev import ocr_osd
+
+
+class _StubOcrModel:
+    """Заменитель TesseractOcrCliModel: считает запуски OSD и ходит по страницам
+    так же, как Docling — вызывая `_perform_osd` на каждую страницу."""
+
+    def __init__(self, orientations):
+        # orientations: что вернёт OSD на n-й странице; Exception — падение OSD
+        self.orientations = list(orientations)
+        self.runs = 0
+
+    def _perform_osd(self, ifilename):
+        import pandas as pd
+        i = min(self.runs, len(self.orientations) - 1)
+        self.runs += 1
+        val = self.orientations[i]
+        if isinstance(val, Exception):
+            raise val
+        return pd.DataFrame({"key": ["Page number", "Orientation in degrees"],
+                             "value": ["0", str(val)]})
+
+    def __call__(self, conv_res, pages):
+        out = []
+        for _ in pages:
+            try:
+                out.append(ocr_osd._orientation_of(self._perform_osd("page.png")))
+            except Exception:
+                out.append(None)          # как Docling: ошибку залогировал и пошёл дальше
+        return out
+
+
+@pytest.fixture
+def stub_osd():
+    """Класс со свежим патчем; после теста патч снимается."""
+    cls = type("_StubPatched", (_StubOcrModel,), {})
+    ocr_osd.install_osd_cache(cls=cls)
+    ocr_osd.reset_osd_stats()
+    yield cls
+    ocr_osd.uninstall_osd_cache(cls)
+
+
+def test_osd_runs_once_per_document(stub_osd):
+    """Вертикальные страницы: один процесс tesseract на документ, не на страницу."""
+    model = stub_osd([0, 0, 0, 0, 0])
+    res = _StubRes()
+    assert model(res, range(5)) == [0] * 5
+    assert model.runs == 1
+    st = ocr_osd.osd_stats()
+    assert (st["osd_runs"], st["osd_reused"], st["docs"]) == (1, 4, 1)
+
+
+def test_osd_rotated_page_disables_cache(stub_osd):
+    """Повёрнутая страница — кэш не включаем: страницы могут быть разными."""
+    model = stub_osd([90, 90, 0])
+    out = model(_StubRes(), range(3))
+    assert model.runs == 3
+    assert out == [90, 90, 0]
+
+
+class _StubRes:
+    """Стенд-ин для ConversionResult: как и он, поддерживает слабые ссылки."""
+
+
+def test_osd_cache_reset_between_documents(stub_osd):
+    """Новый ConversionResult — новая проба OSD (ориентация могла измениться)."""
+    model = stub_osd([0, 0, 0, 0])
+    doc1, doc2 = _StubRes(), _StubRes()      # держим живыми: адреса не должны совпасть
+    model(doc1, range(2))
+    model(doc2, range(2))
+    assert model.runs == 2                  # по одному на документ
+    assert ocr_osd.osd_stats()["docs"] == 2
+
+
+def test_osd_pages_of_same_document_batched(stub_osd):
+    """Docling отдаёт страницы батчами — кэш не должен сбрасываться внутри документа."""
+    model = stub_osd([0] * 6)
+    res = _StubRes()
+    model(res, range(3))
+    model(res, range(3))
+    assert model.runs == 1
+    assert ocr_osd.osd_stats()["docs"] == 1
+
+
+def test_osd_failure_not_cached(stub_osd):
+    """«Too few characters» на первой странице не должно отключать OSD на всём
+    документе: следующая страница пробует честно, и её результат кэшируется."""
+    model = stub_osd([RuntimeError("Too few characters"), 0, 0, 0])
+    out = model(_StubRes(), range(4))
+    assert out[0] is None                   # первая страница без ориентации
+    assert out[1:] == [0, 0, 0]
+    assert model.runs == 2                  # падение + успешная проба
+    assert ocr_osd.osd_stats()["osd_failures"] == 1
+
+
+def test_osd_install_idempotent(stub_osd):
+    """Повторная установка не должна наслаивать обёртки."""
+    assert ocr_osd.install_osd_cache(cls=stub_osd) is True
+    model = stub_osd([0, 0, 0])
+    model(_StubRes(), range(3))
+    assert model.runs == 1
+
+
+def test_osd_orientation_parse_tolerates_garbage():
+    import pandas as pd
+    assert ocr_osd._orientation_of(pd.DataFrame({"key": [], "value": []})) == 0
+    assert ocr_osd._orientation_of(
+        pd.DataFrame({"key": ["Orientation in degrees"], "value": ["мусор"]})) == 0
+    assert ocr_osd._orientation_of(
+        pd.DataFrame({"key": ["Orientation in degrees"], "value": [" 270 "]})) == 270
+    assert ocr_osd._orientation_of(None) == 0
+
+
+def test_osd_no_dpi_stamp_left():
+    """Штамп DPI отвергнут замером (терял текст) — функции не должно остаться,
+    иначе кто-нибудь включит её снова."""
+    assert not hasattr(ocr_osd, "_stamp_dpi")
+    from docling_dev import ocr_preprocess as opre_mod
+    assert not hasattr(opre_mod, "_save_page")

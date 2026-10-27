@@ -619,6 +619,8 @@ def install_tesseract_preprocess(
     _orig_run = _ORIG_RUN
 
     def _run_pre(self, ifilename, osd=None):
+        # Разрешение в PNG (pHYs) НЕ проставляем: с известным DPI tesseract
+        # иначе разбирает страницу и теряет текст — см. docling_dev/ocr_osd.py.
         try:
             bgr = cv2.imread(ifilename, cv2.IMREAD_COLOR)
             if bgr is not None:
