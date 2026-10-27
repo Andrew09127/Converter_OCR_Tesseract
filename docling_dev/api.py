@@ -96,8 +96,44 @@ def _get_ocr_reader():
     
 #Фоновые воркеры
 
+#Прогресс по страницам (п.2.5)
+
+# Распознавание занимает почти всё время задачи, поэтому страницы двигают
+# полосу от 0.35 (файл принят, модели готовы) до 0.90 (страницы пройдены,
+# остались сборка DOCX, подсветка и опционально LLM).
+_PROGRESS_FROM = 0.35
+_PROGRESS_TO = 0.90
+
+
+def _page_progress(done: int, total: int) -> float:
+    """Доля для полосы по числу пройденных страниц."""
+    if total <= 0:
+        return _PROGRESS_FROM
+    share = min(max(done / total, 0.0), 1.0)
+    return round(_PROGRESS_FROM + (_PROGRESS_TO - _PROGRESS_FROM) * share, 3)
+
+
+def _page_count(pdf_path: Path) -> int:
+    """Число страниц в PDF. 0 — если не прочитался: тогда полоса просто не
+    двигается постранично, как было до п.2.5."""
+    try:
+        import pypdfium2
+        doc = pypdfium2.PdfDocument(str(pdf_path))
+        try:
+            return len(doc)
+        finally:
+            doc.close()
+    except Exception as exc:                         # noqa: BLE001
+        log.debug("api: не удалось узнать число страниц в %s (%s)",
+                  pdf_path.name, exc)
+        return 0
+
+
+#Фоновые воркеры (продолжение)
+
 def _run_scan(job_id: str, pdf_path: Path, docx_path: Path, flags: dict) -> None:
     """Прогон скана через Docling-пайплайн (медленный путь)."""
+    from . import progress as page_progress
     try:
         _set(job_id, status="running", stage="Анализ скана…", progress=0.1)
         converter = _get_scan_converter(flags["ocr_preprocess"])
@@ -105,16 +141,35 @@ def _run_scan(job_id: str, pdf_path: Path, docx_path: Path, flags: dict) -> None
         # OCR-reader нужен только для word_order — иначе не создаём.
         ocr_reader = _get_ocr_reader() if flags["word_order"] else None
 
-        _set(job_id, stage="Распознавание текста и сборка DOCX…", progress=0.35)
+        total = _page_count(pdf_path)
+
+        def _on_page(done: int, pages: int) -> None:
+            if done >= pages > 0:
+                _set(job_id, stage="Сборка документа…",
+                     progress=_page_progress(done, pages))
+            else:
+                # Фронт печатает это после слова «Обработка: », поэтому текст
+                # короткий и без собственного двоеточия.
+                _set(job_id, stage=f"Страница {done} из {pages}",
+                     progress=_page_progress(done, pages))
+
+        # Первая страница доходит до конца конвейера не сразу (замер: 11.8 s на
+        # файле в 7 страниц), поэтому текст должен объяснять, чего ждём.
+        _set(job_id, stage="Распознавание страниц…", progress=_PROGRESS_FROM)
+        page_progress.start(total, _on_page)
         from . import convert_pdf
-        ok = convert_pdf(
-            pdf_path, docx_path, converter,
-            ocr_reader=ocr_reader,
-            use_word_order=flags["word_order"],
-            highlight=flags["highlight"],
-            llm=flags["llm"],
-            ink_bold=flags["ink_bold"],
-        )
+        try:
+            ok = convert_pdf(
+                pdf_path, docx_path, converter,
+                ocr_reader=ocr_reader,
+                use_word_order=flags["word_order"],
+                highlight=flags["highlight"],
+                llm=flags["llm"],
+                ink_bold=flags["ink_bold"],
+            )
+        finally:
+            # Обязательно: иначе следующая задача досчитает страницы в эту.
+            page_progress.finish()
         if ok and docx_path.exists():
             _set(job_id, status="done", stage="Готово", progress=1.0)
         else:

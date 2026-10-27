@@ -2482,3 +2482,127 @@ def _built_pipeline_opts():
     from docling_dev import build_converter
     conv = build_converter(ocr_preprocess=False)
     return conv.format_to_options[InputFormat.PDF].pipeline_options
+
+#  ПРОГРЕСС ПО СТРАНИЦАМ (п.2.5)
+
+from docling_dev import progress as page_progress
+
+
+class _StubAssemble:
+    """Заменитель PageAssembleModel: как и он, выдаёт страницы по одной."""
+
+    def __call__(self, conv_res, page_batch):
+        for page in page_batch:
+            yield page
+
+
+@pytest.fixture
+def progress_patch():
+    """Класс со свежим патчем счёта страниц; после теста патч снимается."""
+    cls = type("_StubAssemblePatched", (_StubAssemble,), {})
+    page_progress.install_page_progress(cls)
+    yield cls
+    page_progress.uninstall_page_progress(cls)
+    page_progress.finish()
+
+
+def test_progress_counts_pages_in_order(progress_patch):
+    """Полоса двигается постранично: подписчик получает 1 из 4, 2 из 4, …"""
+    seen = []
+    page_progress.start(4, lambda done, total: seen.append((done, total)))
+    model = progress_patch()
+    out = list(model(None, ["стр1", "стр2", "стр3", "стр4"]))
+    assert out == ["стр1", "стр2", "стр3", "стр4"]     # страницы не потерялись
+    assert seen == [(1, 4), (2, 4), (3, 4), (4, 4)]
+
+
+def test_progress_counts_across_batches(progress_patch):
+    """Docling отдаёт страницы батчами — счёт не должен сбрасываться."""
+    seen = []
+    page_progress.start(5, lambda d, t: seen.append(d))
+    model = progress_patch()
+    list(model(None, ["a", "b"]))
+    list(model(None, ["c", "d", "e"]))
+    assert seen == [1, 2, 3, 4, 5]
+
+
+def test_progress_without_listener_is_noop(progress_patch):
+    """В CLI подписчика нет — патч обязан просто пропускать страницы."""
+    page_progress.finish()
+    model = progress_patch()
+    assert list(model(None, ["a", "b"])) == ["a", "b"]
+    assert page_progress.stats() == {"total": 0, "done": 0, "listening": False}
+
+
+def test_progress_finish_stops_counting(progress_patch):
+    """finish() обязателен в finally: иначе следующая задача досчитает
+    страницы в предыдущую."""
+    seen = []
+    page_progress.start(2, lambda d, t: seen.append(d))
+    model = progress_patch()
+    list(model(None, ["a"]))
+    page_progress.finish()
+    list(model(None, ["b"]))
+    assert seen == [1]
+
+
+def test_progress_listener_failure_does_not_break_conversion(progress_patch):
+    """Упавший подписчик не должен ронять конвертацию: прогресс — украшение,
+    а не часть результата."""
+    def bad(done, total):
+        raise RuntimeError("подписчик сломался")
+
+    page_progress.start(2, bad)
+    model = progress_patch()
+    assert list(model(None, ["a", "b"])) == ["a", "b"]
+
+
+def test_progress_install_idempotent_and_reversible(progress_patch):
+    orig = progress_patch._progress_orig_call
+    assert page_progress.install_page_progress(progress_patch) is True
+    assert progress_patch._progress_orig_call is orig      # не наслоилось
+    assert page_progress.uninstall_page_progress(progress_patch) is True
+    assert progress_patch.__call__ is orig
+    assert page_progress.uninstall_page_progress(progress_patch) is False
+
+
+@pytest.mark.parametrize("done,total,expected", [
+    (0, 4, 0.35),
+    (1, 4, 0.487),      # 0.4875 округляется вниз — так устроен round у float
+    (2, 4, 0.625),
+    (4, 4, 0.9),
+    (7, 7, 0.9),
+    (1, 0, 0.35),        # число страниц неизвестно — полоса стоит, как раньше
+    (9, 4, 0.9),         # больше страниц, чем ожидали, — не вылезаем за предел
+])
+def test_page_progress_formula(done, total, expected):
+    """Страницы двигают полосу от 0.35 до 0.90; остаток — сборка DOCX,
+    подсветка и опционально LLM."""
+    from docling_dev import api as dev_api
+    assert dev_api._page_progress(done, total) == expected
+
+
+def test_page_count_reads_pdf(tmp_path):
+    """Число страниц берётся из самого файла; нечитаемый файл даёт 0, и тогда
+    поведение остаётся прежним (полоса не двигается постранично)."""
+    import fitz
+    from docling_dev import api as dev_api
+    doc = fitz.open()
+    for _ in range(3):
+        doc.new_page()
+    pdf = tmp_path / "three.pdf"
+    doc.save(str(pdf))
+    doc.close()
+    assert dev_api._page_count(pdf) == 3
+
+    broken = tmp_path / "broken.pdf"
+    broken.write_bytes(b"not a pdf at all")
+    assert dev_api._page_count(broken) == 0
+
+
+def test_progress_installed_by_build_converter():
+    """Патч должен ставиться из build_converter, иначе в API считать нечего."""
+    import inspect
+    from docling_dev import pipeline
+    src = inspect.getsource(pipeline.build_converter)
+    assert "install_page_progress" in src

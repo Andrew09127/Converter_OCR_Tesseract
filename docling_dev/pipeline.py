@@ -196,6 +196,15 @@ def build_converter(
     except Exception as _exc:
         log.debug("table_limits недоступен: %s", _exc)
 
+    # Счёт страниц для полосы прогресса в интерфейсе: на последней стадии
+    # конвейера, где страница уже прошла и OCR, и разметку, и таблицы.
+    # Без подписчика (CLI) — no-op, см. docling_dev/progress.py.
+    try:
+        from .progress import install_page_progress
+        install_page_progress()
+    except Exception as _exc:
+        log.debug("progress недоступен: %s", _exc)
+
     ocr_opts = _tesseract_options(langs)
 
     pipeline_opts = PdfPipelineOptions()
