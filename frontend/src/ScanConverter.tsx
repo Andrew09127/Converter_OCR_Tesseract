@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Accordion,
   AccordionDetails,
@@ -22,12 +22,22 @@ import DescriptionIcon from "@mui/icons-material/Description";
 import CloseIcon from "@mui/icons-material/Close";
 import {
   ConvertMode,
+  MachineProfile,
   ScanFlags,
   analyzePdf,
   downloadResult,
+  getProfile,
   pollUntilDone,
   startConversion,
+  startPolish,
 } from "./api";
+
+// Названия ресурсных профилей по-русски (их выбирает бэкенд по машине).
+const PROFILE_RU: Record<string, string> = {
+  lean: "экономный",
+  balanced: "сбалансированный",
+  full: "полный",
+};
 
 // Версия приложения (показывается в шапке и памятке).
 const VERSION = "2.0.2";
@@ -95,13 +105,35 @@ export default function ScanConverter() {
   // Рекомендованный анализатором режим — для подсветки кнопки. null — ещё не определён.
   const [suggestedMode, setSuggestedMode] = useState<ConvertMode | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
+  // Профиль машины (фаза 3): на слабом ПК LLM-доочистку не предлагаем заранее.
+  const [profile, setProfile] = useState<MachineProfile | null>(null);
+  // Предупреждение до начала работы: текстовый слой (п.1.5) или нехватка
+  // памяти под этот файл (п.3.4). Не ошибка — конвертацию не запрещаем.
+  const [warning, setWarning] = useState<string | null>(null);
+  // Готовая скан-задача: по ней доступна доочистка текста (п.3.2).
+  const [doneJob, setDoneJob] = useState<{ id: string; filename: string } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Профиль спрашиваем один раз при открытии: от него зависит, включать ли
+  // галочку LLM-доочистки по умолчанию (на lean/balanced она стоит ~1.6 ГБ).
+  useEffect(() => {
+    getProfile()
+      .then((p) => {
+        setProfile(p);
+        setFlags((prev) => ({ ...prev, iim: p.llm_default }));
+      })
+      .catch(() => {
+        // Профиль не критичен: оставляем значения по умолчанию.
+      });
+  }, []);
 
   // Сбрасывает выбранный файл и связанное состояние (рекомендацию, прогресс).
   function clearFile() {
     setFile(null);
     setSuggestedMode(null);
     setProgress(0);
+    setWarning(null);
+    setDoneJob(null);
     setStatus("Ожидание выбора PDF-файла…");
     setStatusKind("info");
   }
@@ -116,6 +148,8 @@ export default function ScanConverter() {
     setFile(f);
     setProgress(0);
     setSuggestedMode(null);
+    setWarning(null);
+    setDoneJob(null);
     setStatusKind("info");
     setStatus("Определяем тип документа…");
     setAnalyzing(true);
@@ -143,16 +177,52 @@ export default function ScanConverter() {
       const final = await pollUntilDone(jobId, (s) => {
         setProgress(Math.round(s.progress * 100));
         setStatus(`Обработка: ${s.stage}`);
+        if (s.warning) setWarning(s.warning);
       });
       if (final.status === "done") {
         await downloadResult(jobId, final.filename);
         setProgress(100);
         setStatusKind("success");
         setStatus(`Готово: ${final.filename} скачан.`);
+        // Доочистка имеет смысл только для скана и только если её не делали.
+        if (mode === "scan" && !flags.iim && !final.polished) {
+          setDoneJob({ id: jobId, filename: final.filename });
+        }
       } else {
         setStatusKind("error");
         setStatus(`Ошибка: ${final.error || "конвертация не удалась"}`);
       }
+    } catch (e) {
+      setStatusKind("error");
+      setStatus(`Ошибка: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Доочистка готового документа (п.3.2): распознавание не повторяется, модель
+  // проходит только по жёлтым подсветкам, сохранённым в самом DOCX.
+  async function polish() {
+    if (!doneJob || busy) return;
+    setBusy(true);
+    setProgress(0);
+    setStatusKind("info");
+    setStatus("Запускаем доочистку текста…");
+    try {
+      await startPolish(doneJob.id);
+      const final = await pollUntilDone(doneJob.id, (s) => {
+        setProgress(Math.round(s.progress * 100));
+        setStatus(`Обработка: ${s.stage}`);
+      });
+      await downloadResult(doneJob.id, final.filename);
+      setProgress(100);
+      setStatusKind(final.error ? "error" : "success");
+      setStatus(
+        final.error
+          ? `Доочистка не удалась: ${final.error}. Исходный документ скачан.`
+          : `Готово: ${final.filename} скачан (исправлено ${final.polish_fixed ?? 0}).`,
+      );
+      setDoneJob(null);
     } catch (e) {
       setStatusKind("error");
       setStatus(`Ошибка: ${(e as Error).message}`);
@@ -228,6 +298,14 @@ export default function ScanConverter() {
           </Box>
 
           <Alert severity={statusKind} variant="outlined">{status}</Alert>
+
+          {/* Предупреждение (текстовый слой в скан-режиме или нехватка памяти):
+              не ошибка, конвертация идёт — поэтому отдельной плашкой. */}
+          {warning && (
+            <Alert severity="warning" variant="outlined" onClose={() => setWarning(null)}>
+              {warning}
+            </Alert>
+          )}
 
           {/* Две карточки режимов с пояснениями.
               Анализатор подсвечивает рекомендованную карточку зелёной рамкой и делает
@@ -324,6 +402,26 @@ export default function ScanConverter() {
             </Box>
           )}
 
+          {/* Доочистка текста (п.3.2): предлагаем ПОСЛЕ получения документа, чтобы
+              пользователь сам решил, платить ли за неё временем и памятью —
+              модель 1.5B занимает около 1.6 ГБ. */}
+          {doneJob && !busy && (
+            <Alert
+              severity="info"
+              variant="outlined"
+              action={
+                <Button color="inherit" size="small" startIcon={<PsychologyIcon />}
+                        onClick={polish}>
+                  Доочистить
+                </Button>
+              }
+            >
+              Документ готов. Жёлтым выделены слова, в которых распознавание
+              сомневается. Можно догнать их локальной моделью — это займёт ещё
+              немного времени и памяти.
+            </Alert>
+          )}
+
           {/* Флаги (применяются к скан-режиму) */}
           <Accordion disableGutters sx={{ borderRadius: 2, "&:before": { display: "none" } }}
                      variant="outlined">
@@ -337,6 +435,18 @@ export default function ScanConverter() {
                 Эти настройки влияют только на режим «Отсканированный PDF». Для большинства
                 документов менять их не нужно — значения по умолчанию подобраны оптимально.
               </Typography>
+              {/* Профиль объясняет, почему часть настроек выключена: на слабой
+                  машине доочистка не включается сама, она стоит ~1.6 ГБ. */}
+              {profile && (
+                <Typography variant="caption" color="text.secondary"
+                            sx={{ display: "block", mb: 1.5 }}>
+                  Этот компьютер: {profile.cores} ядер, {profile.ram_gb} ГБ памяти —
+                  выбран режим «{PROFILE_RU[profile.profile]}».
+                  {!profile.llm_default &&
+                    " Доочистка текста по умолчанию выключена: её можно включить" +
+                    " здесь или запустить кнопкой уже после конвертации."}
+                </Typography>
+              )}
               <Stack spacing={1}>
                 {FLAG_DEFS.map((f) => {
                   // Для «обратных» флагов галочка показывает противоположное значение.

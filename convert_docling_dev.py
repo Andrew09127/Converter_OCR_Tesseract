@@ -155,6 +155,13 @@ def main() -> None:
              "может портить мелкий текст хороших (CLAHE-артефакты)."
     )
     parser.add_argument(
+        "--profile", choices=("lean", "balanced", "full", "auto"), default=None,
+        help="Ресурсный профиль (по умолчанию выбирается по машине): lean — "
+             "слабый ПК (1 воркер OCR, 2 потока, без LLM: замер по корпусу "
+             "256 s при пике 1.4 ГБ), balanced (214 s / 1.7 ГБ), full "
+             "(215 s / 2.0 ГБ). Подробности в docling_dev/profiles.py."
+    )
+    parser.add_argument(
         "--ocr-workers", type=int, default=None, metavar="N",
         help="Сколько страниц распознавать ОДНОВРЕМЕННО (по умолчанию 4, но не "
              "больше числа ядер). Ускоряет сканы примерно на треть; каждая "
@@ -163,15 +170,20 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Число воркеров OCR передаётся через окружение: его читает
-    # ocr_parallel.resolve_workers, и так флаг не приходится протаскивать
-    # через всю цепочку вызовов до build_converter.
+    # Профиль и число воркеров передаются через окружение: их читают
+    # profiles.resolve и ocr_parallel.resolve_workers, и так флаги не
+    # приходится протаскивать через всю цепочку вызовов до build_converter.
+    if args.profile:
+        os.environ["CONVERTER_PROFILE"] = args.profile
     if args.ocr_workers is not None:
         os.environ["CONVERTER_OCR_WORKERS"] = str(args.ocr_workers)
 
     use_word_order = args.word_order
     highlight      = not args.no_highlight
-    llm            = not args.no_llm
+    # LLM-доочистка по умолчанию зависит от профиля: на слабой машине она стоит
+    # ~1.6 ГБ пика и её не включают молча. --no-llm выключает явно и всегда.
+    from docling_dev.profiles import resolve as _resolve_profile
+    llm            = (not args.no_llm) and _resolve_profile().llm_default
     ocr_preprocess = args.ocr_preprocess
 
     if args.pdf:

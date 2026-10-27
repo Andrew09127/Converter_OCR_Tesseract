@@ -220,6 +220,29 @@ def _accept_upload(file: UploadFile) -> tuple[str, Path, Path]:
 
 #Эндпоинты
 
+@router.get("/profile")
+async def convert_profile():
+    """Ресурсный профиль машины (пункт 3.1): по нему интерфейс решает, предлагать
+    ли LLM-доочистку по умолчанию и чего ждать по времени.
+
+    Профиль выбирается по ядрам и памяти; переключается переменной
+    CONVERTER_PROFILE (lean | balanced | full | auto).
+    """
+    from .profiles import machine, resolve
+    prof = resolve()
+    m = machine()
+    return {
+        "profile": prof.name,
+        "note": prof.note,
+        "ocr_workers": prof.ocr_workers,
+        "num_threads": prof.num_threads,
+        "llm_default": prof.llm_default,
+        "cores": m["cores"],
+        "ram_gb": round(m["ram_gb"], 1),
+        "free_gb": round(m["free_gb"], 1),
+    }
+
+
 @router.post("/analyze")
 async def analyze_pdf(file: UploadFile = File(...)):
     """
@@ -262,6 +285,15 @@ async def convert_scan(
     except Exception as exc:                         # noqa: BLE001
         log.debug("scan: не удалось проверить текстовый слой: %s", exc)
         warning = None
+    # Пункт 3.4: не падать с MemoryError на слабой машине, а предупредить до
+    # начала работы. Отказывать не будем — пользователь вправе попробовать.
+    try:
+        from .profiles import memory_warning, resolve
+        mem = memory_warning(resolve(), _page_count(pdf_path))
+    except Exception as exc:                         # noqa: BLE001
+        log.debug("scan: не удалось оценить память: %s", exc)
+        mem = None
+    warning = " ".join(w for w in (warning, mem) if w) or None
     if warning:
         log.info("scan: %s (%s)", warning, pdf_path.name)
     flags = {
@@ -301,7 +333,72 @@ async def convert_status(job_id: str):
             raise HTTPException(status_code=404, detail="Задача не найдена.")
         return {"job_id": job_id, "status": job["status"], "stage": job["stage"],
                 "progress": job["progress"], "filename": job["filename"],
-                "error": job["error"], "warning": job.get("warning")}
+                "error": job["error"], "warning": job.get("warning"),
+                # Для кнопки «Доочистить текст» (п.3.2): есть ли смысл её
+                # показывать и не нажата ли она уже.
+                "mode": job.get("mode"), "polished": bool(job.get("polished")),
+                "polish_fixed": job.get("polish_fixed")}
+
+
+def _run_polish(job_id: str, docx_path: Path) -> None:
+    """LLM-доочистка уже готового DOCX (пункт 3.2).
+
+    Распознавание и разметка не повторяются: подсветка сохранена в самом файле,
+    а `correct_highlighted` работает именно по подсвеченным прогонам. Поэтому
+    шаг стоит только времени LLM, без OCR и без моделей Docling.
+    """
+    try:
+        _set(job_id, status="running", stage="Доочистка текста…", progress=0.3)
+        from docx import Document
+        doc = Document(str(docx_path))
+        from .llm_correct import correct_highlighted
+        fixed = correct_highlighted(doc, None)
+        doc.save(str(docx_path))
+        _set(job_id, status="done", stage=f"Доочистка: исправлено {fixed}",
+             progress=1.0, polished=True, polish_fixed=fixed)
+        log.info("polish: задача %s, исправлено %d фрагментов", job_id, fixed)
+    except Exception as e:                           # noqa: BLE001
+        log.exception("api: ошибка доочистки %s", job_id)
+        # Файл остаётся прежним и его по-прежнему можно скачать, поэтому
+        # задача снова `done`, а не `error`: сломалась доочистка, не результат.
+        _set(job_id, status="done", stage="Доочистка не удалась", progress=1.0,
+             error=str(e))
+
+
+@router.post("/polish/{job_id}")
+async def convert_polish(job_id: str):
+    """Догнать готовый DOCX LLM-доочисткой по кнопке (пункт 3.2).
+
+    Смысл в том, что модель 1.5B стоит ~1.6 ГБ пика и заметного времени. На
+    слабой машине её не включают заранее (профиль `lean`/`balanced`), поэтому
+    пользователь сначала получает документ, смотрит жёлтые подсветки и сам
+    решает, платить ли за доочистку.
+
+    Идёт в ту же однопоточную очередь, что и конвертации. Прогресс и результат —
+    через обычный `GET /convert/status/{job_id}`.
+    """
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Задача не найдена.")
+        if job["status"] != "done":
+            raise HTTPException(status_code=409,
+                                detail="Доочистка возможна только после "
+                                       "завершения конвертации.")
+        if job.get("mode") != "scan":
+            raise HTTPException(status_code=400,
+                                detail="Доочистка есть только для режима "
+                                       "распознавания скана.")
+        if job.get("polished"):
+            raise HTTPException(status_code=409,
+                                detail="Этот документ уже доочищен.")
+        docx_path = Path(job["docx_path"])
+        job.update(status="queued", stage="Доочистка в очереди…", progress=0.0,
+                   error=None)
+    if not docx_path.exists():
+        raise HTTPException(status_code=410, detail="Результат недоступен.")
+    _EXECUTOR.submit(_run_polish, job_id, docx_path)
+    return {"job_id": job_id, "status": "queued"}
 
 
 @router.get("/download/{job_id}")

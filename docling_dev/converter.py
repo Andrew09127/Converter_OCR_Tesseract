@@ -3617,6 +3617,16 @@ def convert_pdf(
 
         doc = build_docx(dl_doc, page_sizes, ocr_reader=ocr_reader,
                          use_word_order=effective_word_order, ink_bold=ink_bold)
+
+        # Пункт 3.5: документ Docling держит картинки всех страниц (замерено
+        # ~13 МБ на страницу), а дальше идут подсветка и, возможно, LLM со
+        # своими ~1.6 ГБ. Складывать эти два пика незачем — страницы больше не
+        # нужны, DOCX уже собран.
+        del dl_doc
+        del result
+        import gc
+        gc.collect()
+
         if highlight:
             # Автоочистка детерминируемых OCR-ошибок в помеченных словах +
             # подсветка остатка жёлтым (для быстрой ручной вычитки).

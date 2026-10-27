@@ -125,9 +125,10 @@ def _tesseract_options(langs: list[str]):
 
 def build_converter(
     langs: list[str] | None = None,
-    images_scale: float = 2.0,
+    images_scale: float | None = None,
     ocr_preprocess: bool = False,
     ocr_workers: int | None = None,
+    profile: str | None = None,
 ) -> DocumentConverter:
     """
     Создаёт DocumentConverter для сканов:
@@ -140,14 +141,28 @@ def build_converter(
     разрешение page images (generate_page_images), которые используют word_order
     и ink_bold — 2.0 → 144 DPI, достаточно и не раздувает память.
 
-    ocr_workers — сколько страниц распознавать одновременно (None → по числу
-    ядер, не больше 4, либо CONVERTER_OCR_WORKERS). Каждый воркер держит свою
-    страницу в 216 DPI (~96 МБ) и свой процесс tesseract: пик памяти растёт
-    примерно на 100 МБ за каждую сверхплановую страницу, поэтому на слабых
-    машинах воркеров опускают.
+    ocr_workers — сколько страниц распознавать одновременно (None → из профиля,
+    либо CONVERTER_OCR_WORKERS). Каждый воркер держит свою страницу в 216 DPI
+    (~96 МБ) и свой процесс tesseract: пик памяти растёт примерно на 100 МБ за
+    каждую сверхплановую страницу, поэтому на слабых машинах воркеров опускают.
+
+    profile — ресурсный профиль (`lean` | `balanced` | `full` | `auto`); None →
+    `CONVERTER_PROFILE` или выбор по машине. Профиль задаёт воркеров, потоки
+    моделей и images_scale, см. docling_dev/profiles.py. Явные аргументы
+    `images_scale` и `ocr_workers` профиль перебивают — это нужно замерам.
     """
     if langs is None:
         langs = ["ru", "en"]
+
+    # Профиль под машину: на слабой лучше медленнее, чем MemoryError.
+    from .profiles import apply_threads, describe, resolve
+    prof = resolve(profile)
+    apply_threads(prof)
+    log.info("%s", describe(prof))
+    if images_scale is None:
+        images_scale = prof.images_scale
+    if ocr_workers is None and not os.environ.get("CONVERTER_OCR_WORKERS", "").strip():
+        ocr_workers = prof.ocr_workers
 
     # Предобработка изображения перед Tesseract.
     # despeckle (удаление пятен/грязи скана) — ВСЕГДА ВКЛ: строкоцентричный
@@ -208,6 +223,9 @@ def build_converter(
     ocr_opts = _tesseract_options(langs)
 
     pipeline_opts = PdfPipelineOptions()
+    # Потоки моделей: Docling по умолчанию берёт 4 независимо от машины, а на
+    # двух ядрах это душит интерфейс.
+    pipeline_opts.accelerator_options.num_threads = prof.num_threads
     if os.path.isdir(_DOCLING_MODELS_DIR):
         _ensure_docling_models()
         pipeline_opts.artifacts_path = _DOCLING_MODELS_DIR

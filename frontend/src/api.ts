@@ -33,6 +33,42 @@ export interface JobStatus {
   progress: number;
   filename: string;
   error: string | null;
+  // Предупреждение до начала работы: текстовый слой в скан-режиме (п.1.5) или
+  // нехватка памяти под этот файл (п.3.4). Не ошибка — режим не запрещается.
+  warning?: string | null;
+  mode?: ConvertMode;
+  // Доочистка LLM уже прогонялась по этому документу (п.3.2).
+  polished?: boolean;
+  polish_fixed?: number | null;
+}
+
+// Ресурсный профиль машины (фаза 3). Нужен, чтобы НЕ предлагать LLM-доочистку
+// по умолчанию на слабом ПК: модель 1.5B стоит ~1.6 ГБ пика и заметного времени.
+export interface MachineProfile {
+  profile: "lean" | "balanced" | "full";
+  note: string;
+  ocr_workers: number;
+  num_threads: number;
+  llm_default: boolean;
+  cores: number;
+  ram_gb: number;
+  free_gb: number;
+}
+
+export async function getProfile(): Promise<MachineProfile> {
+  const res = await fetch("/convert/profile");
+  if (!res.ok) throw new Error(`Профиль недоступен (${res.status})`);
+  return (await res.json()) as MachineProfile;
+}
+
+// Догоняет уже готовый DOCX LLM-доочисткой (п.3.2): распознавание не
+// повторяется, работа идёт по сохранённым в файле жёлтым подсветкам.
+export async function startPolish(jobId: string): Promise<void> {
+  const res = await fetch(`/convert/polish/${jobId}`, { method: "POST" });
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}));
+    throw new Error(detail.detail || `Доочистка не запустилась (${res.status})`);
+  }
 }
 
 // Запускает конвертацию. Для скана прикладывает флаги, для нативного — только файл.

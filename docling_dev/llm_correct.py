@@ -55,8 +55,26 @@ def _env_int(name: str, default: int | None) -> int | None:
 
 
 _THREADS_BATCH = _env_int("CONVERTER_LLM_THREADS", None)
-_UNLOAD_AFTER  = os.environ.get("CONVERTER_LLM_UNLOAD", "").strip() in ("1", "true", "yes")
 _CTX_CHARS     = _env_int("CONVERTER_LLM_CTX", 600) or 600
+
+
+def _unload_after() -> bool:
+    """Выгружать ли модель после задачи.
+
+    Модель 1.5B Q4 держит ~1.6 ГБ пика (замер фазы 0), поэтому на слабой машине
+    её надо отдавать сразу, а на мощной — держать: повторная загрузка стоит
+    секунды. Решает профиль (пункт 3.2), `CONVERTER_LLM_UNLOAD` перебивает.
+    """
+    raw = os.environ.get("CONVERTER_LLM_UNLOAD", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    try:
+        from .profiles import resolve
+        return resolve().llm_unload
+    except Exception:                               # noqa: BLE001
+        return False
 
 _DIGIT_RE    = re.compile(r"\d")
 _DIGIT_ONLY  = re.compile(r"^\d[\d\s.,\-/]*$")   # токен почти целиком из цифр
@@ -354,7 +372,7 @@ def correct_highlighted(doc, model_path: str | None = None) -> int:
     log.info("LLM-доочистка: исправлено %d фрагментов; запросов к модели %d "
              "(переиспользовано ответов %d, отсеяно до запроса %d)",
              fixed, asked, reused, prefiltered)
-    if _UNLOAD_AFTER:
+    if _unload_after():
         _cleanup_llm()
-        log.info("LLM: модель выгружена (CONVERTER_LLM_UNLOAD)")
+        log.info("LLM: модель выгружена — освободили ~1.6 ГБ")
     return fixed

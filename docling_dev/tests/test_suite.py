@@ -2606,3 +2606,327 @@ def test_progress_installed_by_build_converter():
     from docling_dev import pipeline
     src = inspect.getsource(pipeline.build_converter)
     assert "install_page_progress" in src
+
+#  РЕСУРСНЫЕ ПРОФИЛИ (фаза 3)
+
+from docling_dev import profiles as prof_mod
+
+
+@pytest.fixture
+def machine_as(monkeypatch):
+    """Подменяет машину: профиль обязан выбираться по ядрам и памяти, а не по
+    тому, на чём запущены тесты."""
+    def _set(cores, ram_gb, free_gb=None):
+        monkeypatch.setattr(prof_mod, "machine", lambda: {
+            "cores": cores, "ram_gb": ram_gb,
+            "free_gb": ram_gb if free_gb is None else free_gb})
+    return _set
+
+
+@pytest.mark.parametrize("cores,ram,expected", [
+    (2, 4, "lean"),          # целевая слабая машина фазы 3
+    (2, 32, "lean"),         # мало ядер — потоки важнее памяти
+    (8, 4, "lean"),          # мало памяти
+    (4, 8, "balanced"),
+    (8, 8, "balanced"),      # памяти меньше 12 ГБ
+    (4, 32, "balanced"),     # ядер не больше четырёх
+    (8, 16, "full"),
+    (16, 64, "full"),
+])
+def test_profile_detect_by_machine(machine_as, cores, ram, expected):
+    machine_as(cores, ram)
+    assert prof_mod.detect().name == expected
+
+
+def test_profile_detect_falls_back_to_lean_without_psutil(monkeypatch):
+    """Без psutil машина считается слабой: лучше медленнее, чем MemoryError."""
+    import builtins
+    real_import = builtins.__import__
+
+    def no_psutil(name, *a, **kw):
+        if name == "psutil":
+            raise ImportError("нет psutil")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", no_psutil)
+    assert prof_mod.machine() == {"cores": 1, "ram_gb": 0.0, "free_gb": 0.0}
+    assert prof_mod.detect().name == "lean"
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("lean", "lean"), ("BALANCED", "balanced"), (" full ", "full"),
+])
+def test_profile_env_overrides_machine(monkeypatch, machine_as, value, expected):
+    machine_as(16, 64)                       # мощная машина
+    monkeypatch.setenv("CONVERTER_PROFILE", value)
+    assert prof_mod.resolve().name == expected
+
+
+def test_profile_garbage_env_falls_back_to_machine(monkeypatch, machine_as):
+    """Мусор в переменной не должен ронять конвертацию."""
+    machine_as(2, 4)
+    monkeypatch.setenv("CONVERTER_PROFILE", "супербыстрый")
+    assert prof_mod.resolve().name == "lean"
+
+
+def test_profile_auto_means_by_machine(monkeypatch, machine_as):
+    machine_as(16, 64)
+    monkeypatch.setenv("CONVERTER_PROFILE", "auto")
+    assert prof_mod.resolve().name == "full"
+
+
+def test_profile_argument_wins_over_env(monkeypatch, machine_as):
+    machine_as(16, 64)
+    monkeypatch.setenv("CONVERTER_PROFILE", "full")
+    assert prof_mod.resolve("lean").name == "lean"
+
+
+def test_profile_values_match_measurements():
+    """Значения профилей взяты из замера по корпусу (lean 256.6 s / 1421 МБ,
+    balanced 214.0 s / 1654 МБ, full ~215 s / 1952 МБ). Если их меняют, замер
+    надо переснять — тест об этом напомнит."""
+    assert (prof_mod.LEAN.ocr_workers, prof_mod.LEAN.num_threads,
+            prof_mod.LEAN.images_scale) == (1, 2, 1.0)
+    assert (prof_mod.BALANCED.ocr_workers, prof_mod.BALANCED.num_threads,
+            prof_mod.BALANCED.images_scale) == (2, 4, 1.5)
+    assert (prof_mod.FULL.ocr_workers, prof_mod.FULL.num_threads,
+            prof_mod.FULL.images_scale) == (4, 4, 2.0)
+    # LLM стоит ~1.6 ГБ пика — на слабой машине её не включают молча,
+    # а модель отдают сразу после задачи.
+    assert prof_mod.LEAN.llm_default is False and prof_mod.LEAN.llm_unload is True
+    assert prof_mod.BALANCED.llm_default is False
+    assert prof_mod.FULL.llm_default is True and prof_mod.FULL.llm_unload is False
+
+
+def test_profile_applies_threads(monkeypatch):
+    """Потоки torch надо ограничивать явно: иначе он берёт все ядра и на
+    двухъядерной машине душит интерфейс."""
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+    prof_mod.apply_threads(prof_mod.LEAN)
+    import os
+    assert os.environ["OMP_NUM_THREADS"] == "2"
+    assert os.environ["MKL_NUM_THREADS"] == "2"
+    import torch
+    assert torch.get_num_threads() == 2
+    prof_mod.apply_threads(prof_mod.FULL)        # вернём как было
+
+
+def test_profile_does_not_override_foreign_thread_setting(monkeypatch):
+    """Чужую настройку потоков перебивать нельзя."""
+    monkeypatch.setenv("OMP_NUM_THREADS", "7")
+    prof_mod.apply_threads(prof_mod.LEAN)
+    import os
+    assert os.environ["OMP_NUM_THREADS"] == "7"
+
+
+def test_profile_batches_are_not_profile_dependent():
+    """План предлагал батчи стадий 1/4/8 по профилям, но п.2.2 замерил, что
+    батч разметки и таблиц 1 лучше ВЕЗДЕ (−800 МБ пика и быстрее). В профилях
+    батчей быть не должно."""
+    import dataclasses
+    fields = {f.name for f in dataclasses.fields(prof_mod.Profile)}
+    assert not {f for f in fields if "batch" in f}
+
+
+@pytest.mark.parametrize("profile,free,pages,warn", [
+    ("lean", 8.0, 10, False),        # памяти вдоволь
+    ("lean", 1.0, 10, True),         # меньше, чем нужно
+    ("full", 2.0, 0, True),
+    ("full", 8.0, 0, False),
+    ("full", 3.0, 100, True),        # длинный файл: +13 МБ на страницу
+])
+def test_profile_memory_warning(machine_as, profile, free, pages, warn):
+    """Пункт 3.4: на слабой машине не падать с MemoryError, а предупредить
+    заранее. Режим не запрещаем — пользователь вправе попробовать."""
+    machine_as(8, 16, free_gb=free)
+    msg = prof_mod.memory_warning(prof_mod.PROFILES[profile], pages)
+    assert (msg is not None) is warn
+    if warn:
+        assert "ГБ" in msg
+
+
+def test_profile_memory_warning_silent_without_psutil(machine_as):
+    """Не знаем свободную память — молчим: ложное предупреждение хуже
+    отсутствия (то же правило, что в п.1.5)."""
+    machine_as(1, 0.0, free_gb=0.0)
+    assert prof_mod.memory_warning(prof_mod.LEAN, 10) is None
+
+
+def test_build_converter_applies_profile():
+    """Профиль должен доезжать до опций конвейера, а не только логироваться."""
+    from docling.datamodel.base_models import InputFormat
+    from docling_dev import build_converter
+    import os
+    saved = os.environ.pop("CONVERTER_OCR_WORKERS", None)
+    try:
+        for name, scale, threads, ocr_batch in (
+                ("lean", 1.0, 2, 1), ("balanced", 1.5, 4, 2), ("full", 2.0, 4, 4)):
+            conv = build_converter(ocr_preprocess=False, profile=name)
+            o = conv.format_to_options[InputFormat.PDF].pipeline_options
+            assert o.images_scale == scale
+            assert o.accelerator_options.num_threads == threads
+            assert o.ocr_batch_size == ocr_batch
+            # батчи разметки и таблиц — всегда 1, профиль их не трогает (п.2.2)
+            assert (o.layout_batch_size, o.table_batch_size) == (1, 1)
+    finally:
+        if saved is not None:
+            os.environ["CONVERTER_OCR_WORKERS"] = saved
+
+
+def test_build_converter_explicit_args_beat_profile():
+    """Явные аргументы нужны замерам — они должны перебивать профиль."""
+    from docling.datamodel.base_models import InputFormat
+    from docling_dev import build_converter
+    conv = build_converter(ocr_preprocess=False, profile="lean", images_scale=2.0)
+    o = conv.format_to_options[InputFormat.PDF].pipeline_options
+    assert o.images_scale == 2.0
+
+
+def test_llm_unload_follows_profile(monkeypatch):
+    """LLM держит ~1.6 ГБ: на слабой машине её отдают после задачи, на мощной
+    держат (повторная загрузка стоит секунды). Переменная перебивает профиль."""
+    from docling_dev import llm_correct
+    monkeypatch.delenv("CONVERTER_LLM_UNLOAD", raising=False)
+    monkeypatch.setenv("CONVERTER_PROFILE", "lean")
+    assert llm_correct._unload_after() is True
+    monkeypatch.setenv("CONVERTER_PROFILE", "full")
+    assert llm_correct._unload_after() is False
+    monkeypatch.setenv("CONVERTER_LLM_UNLOAD", "1")
+    assert llm_correct._unload_after() is True
+    monkeypatch.setenv("CONVERTER_LLM_UNLOAD", "0")
+    monkeypatch.setenv("CONVERTER_PROFILE", "lean")
+    assert llm_correct._unload_after() is False
+
+
+def test_api_profile_endpoint(monkeypatch):
+    """Интерфейсу нужен профиль, чтобы решать, предлагать ли LLM по умолчанию."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from docling_dev import api as dev_api
+    monkeypatch.setenv("CONVERTER_PROFILE", "lean")
+    app = FastAPI()
+    app.include_router(dev_api.router)
+    with TestClient(app) as client:
+        r = client.get("/convert/profile")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["profile"] == "lean"
+    assert body["llm_default"] is False
+    assert body["ocr_workers"] == 1
+    assert "cores" in body and "free_gb" in body
+
+
+def test_converter_releases_document_before_llm():
+    """Пункт 3.5: страницы Docling (~13 МБ на страницу) не должны лежать в
+    памяти одновременно с моделью LLM (~1.6 ГБ). Замер на 7 страницах:
+    2887 → 2823 МБ."""
+    import inspect
+    from docling_dev import converter as conv_mod
+    src = inspect.getsource(conv_mod.convert_pdf)
+    build_at = src.index("doc = build_docx")
+    del_at = src.index("del dl_doc")
+    llm_at = src.index("correct_highlighted")
+    assert build_at < del_at < llm_at
+
+#  ДООЧИСТКА ГОТОВОГО DOCX ПО КНОПКЕ (п.3.2)
+
+
+@pytest.fixture
+def polish_client(monkeypatch, tmp_path):
+    """Клиент к роутеру с одной готовой задачей; сама LLM подменена."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from docling_dev import api as dev_api
+    from docx import Document
+
+    docx = tmp_path / "готово.docx"
+    d = Document()
+    d.add_paragraph("текст")
+    d.save(str(docx))
+
+    job_id = "тест-задача"
+    with dev_api._JOBS_LOCK:
+        dev_api._JOBS[job_id] = {
+            "status": "done", "stage": "Готово", "progress": 1.0,
+            "mode": "scan", "filename": docx.name, "docx_path": str(docx),
+            "error": None, "warning": None,
+        }
+    # Задачи в тестах выполняем сразу и в этом же потоке: иначе пришлось бы
+    # ждать очередь, а проверяем мы не её.
+    monkeypatch.setattr(dev_api._EXECUTOR, "submit",
+                        lambda fn, *a: fn(*a))
+    calls = []
+    monkeypatch.setattr("docling_dev.llm_correct.correct_highlighted",
+                        lambda doc, model=None: calls.append(model) or 3)
+
+    app = FastAPI()
+    app.include_router(dev_api.router)
+    yield TestClient(app), job_id, dev_api, calls, docx
+    with dev_api._JOBS_LOCK:
+        dev_api._JOBS.pop(job_id, None)
+
+
+def test_polish_runs_llm_on_existing_docx(polish_client):
+    """Доочистка не повторяет распознавание: она идёт по подсветкам, уже
+    сохранённым в документе."""
+    client, job_id, dev_api, calls, docx = polish_client
+    r = client.post(f"/convert/polish/{job_id}")
+    assert r.status_code == 200
+    assert len(calls) == 1                       # модель позвали ровно раз
+    st = client.get(f"/convert/status/{job_id}").json()
+    assert st["status"] == "done"
+    assert st["polished"] is True
+    assert st["polish_fixed"] == 3
+    assert "исправлено 3" in st["stage"]
+    assert docx.is_file()
+
+
+def test_polish_refuses_second_run(polish_client):
+    """Второй раз гонять модель по тому же файлу незачем."""
+    client, job_id, *_ = polish_client
+    assert client.post(f"/convert/polish/{job_id}").status_code == 200
+    assert client.post(f"/convert/polish/{job_id}").status_code == 409
+
+
+def test_polish_unknown_job_is_404(polish_client):
+    client, *_ = polish_client
+    assert client.post("/convert/polish/нет-такой").status_code == 404
+
+
+def test_polish_refuses_unfinished_job(polish_client):
+    client, job_id, dev_api, *_ = polish_client
+    with dev_api._JOBS_LOCK:
+        dev_api._JOBS[job_id]["status"] = "running"
+    assert client.post(f"/convert/polish/{job_id}").status_code == 409
+
+
+def test_polish_refuses_native_mode(polish_client):
+    """Нативный режим идёт через pdf2docx без подсветки — доочищать нечего."""
+    client, job_id, dev_api, *_ = polish_client
+    with dev_api._JOBS_LOCK:
+        dev_api._JOBS[job_id]["mode"] = "native"
+    assert client.post(f"/convert/polish/{job_id}").status_code == 400
+
+
+def test_polish_failure_keeps_document_downloadable(polish_client, monkeypatch):
+    """Если доочистка упала, документ остаётся прежним и скачиваемым: сломалась
+    доочистка, а не результат конвертации."""
+    client, job_id, dev_api, _calls, docx = polish_client
+
+    def boom(doc, model=None):
+        raise RuntimeError("модель не загрузилась")
+
+    monkeypatch.setattr("docling_dev.llm_correct.correct_highlighted", boom)
+    assert client.post(f"/convert/polish/{job_id}").status_code == 200
+    st = client.get(f"/convert/status/{job_id}").json()
+    assert st["status"] == "done"                # не error: файл цел
+    assert "не удалась" in st["stage"]
+    assert "модель не загрузилась" in (st["error"] or "")
+    assert client.get(f"/convert/download/{job_id}").status_code == 200
+
+
+def test_polish_missing_file_is_410(polish_client):
+    client, job_id, dev_api, _calls, docx = polish_client
+    docx.unlink()
+    assert client.post(f"/convert/polish/{job_id}").status_code == 410
