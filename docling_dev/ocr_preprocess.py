@@ -529,6 +529,10 @@ def is_junk_image(pil_img) -> bool:
         return False
 
 
+# Радиус размытия для unsharp: 1.0 px на 216 DPI — примерно толщина штриха.
+_UNSHARP_SIGMA = 1.0
+
+
 def preprocess_for_ocr(
     image,
     deskew: bool = True,
@@ -536,6 +540,7 @@ def preprocess_for_ocr(
     clahe: bool = True,      # сканах (A/B-тест) — по умолчанию выкл.
     binarize: bool = False,
     despeckle: bool = True,  # удаление пятен/грязи скана (remove_stains)
+    unsharp: float = 0.0,    # сила контурной резкости (0 — выключено)
     max_skew_deg: float = 7.0,
 ):
     """Предобрабатывает numpy-изображение для OCR. Возвращает RGB numpy (3 канала).
@@ -572,6 +577,17 @@ def preprocess_for_ocr(
         if clahe:
             gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
 
+        # 3b) Unsharp mask — ОПЦИЯ, ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНА (замер п.1.Б.1).
+        # Идея была вернуть контур мягким штрихам (растр 150-200 DPI после
+        # даунсэмпла Docling до 216). Замер на 16 страницах корпуса опроверг:
+        # словарных слов становится МЕНЬШЕ при любой силе — 2296 без резкости
+        # против 2269 (сила 0.5), 2270 (0.8), 2276 (1.2) при радиусе 1.0 и
+        # 2265 / 2268 при радиусе 0.6. Параметр оставлен для будущих проб
+        # (например вместе с CLAHE, эта пара не измерялась).
+        if unsharp > 0:
+            blur = cv2.GaussianBlur(gray, (0, 0), _UNSHARP_SIGMA)
+            gray = cv2.addWeighted(gray, 1.0 + unsharp, blur, -unsharp, 0)
+
         # 4) Бинаризация — ОПЦИЯ (по умолчанию выкл; включать после проверки)
         if binarize:
             gray = cv2.adaptiveThreshold(
@@ -594,13 +610,14 @@ def install_tesseract_preprocess(
     clahe: bool = True,
     binarize: bool = False,
     despeckle: bool = True,
+    unsharp: float = 0.0,
 ) -> bool:
     """Monkeypatch TesseractOcrCliModel._run_tesseract: предобрабатывает temp-PNG
     страницы перед запуском tesseract CLI. Повторный вызов с теми же параметрами —
     no-op; с другими — переустанавливает патч поверх оригинала (не наслаивается).
     Возвращает True если патч установлен."""
     global _ORIG_RUN, _INSTALLED
-    params = (deskew, denoise, clahe, binarize, despeckle)
+    params = (deskew, denoise, clahe, binarize, despeckle, unsharp)
     if _INSTALLED == params:
         return True
     if cv2 is None:
@@ -626,7 +643,8 @@ def install_tesseract_preprocess(
             if bgr is not None:
                 rgb = preprocess_for_ocr(bgr[:, :, ::-1], deskew=deskew,
                                          denoise=denoise, clahe=clahe,
-                                         binarize=binarize, despeckle=despeckle)
+                                         binarize=binarize, despeckle=despeckle,
+                                         unsharp=unsharp)
                 cv2.imwrite(ifilename, rgb[:, :, ::-1])
         except Exception as exc:
             log.debug("ocr_preprocess: пропуск (%s)", exc)
@@ -635,6 +653,6 @@ def install_tesseract_preprocess(
     TesseractOcrCliModel._run_tesseract = _run_pre
     _INSTALLED = params
     log.info("ocr_preprocess: предобработка включена (deskew=%s denoise=%s clahe=%s "
-             "binarize=%s despeckle=%s)",
-             deskew, denoise, clahe, binarize, despeckle)
+             "binarize=%s despeckle=%s unsharp=%.2f)",
+             deskew, denoise, clahe, binarize, despeckle, unsharp)
     return True

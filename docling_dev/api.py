@@ -199,6 +199,16 @@ async def convert_scan(
 ):
     """Скан-режим (Docling + RapidOCR + LLM). Возвращает job_id для опроса статуса."""
     job_id, pdf_path, docx_path = _accept_upload(file)
+    # Проверка текстового слоя стоит доли секунды (чтение PyMuPDF) и делается
+    # до постановки в очередь, чтобы предупреждение было видно сразу.
+    try:
+        from .pdf_classifier import scan_mode_warning
+        warning = scan_mode_warning(pdf_path)
+    except Exception as exc:                         # noqa: BLE001
+        log.debug("scan: не удалось проверить текстовый слой: %s", exc)
+        warning = None
+    if warning:
+        log.info("scan: %s (%s)", warning, pdf_path.name)
     flags = {
         "highlight": not no_highlight,   # фронтовый --no-highlight инвертирует подсветку
         "word_order": word_order,
@@ -209,9 +219,10 @@ async def convert_scan(
     with _JOBS_LOCK:
         _JOBS[job_id] = {"status": "queued", "stage": "В очереди…", "progress": 0.0,
                          "mode": "scan", "filename": docx_path.name,
-                         "docx_path": str(docx_path), "error": None}
+                         "docx_path": str(docx_path), "error": None,
+                         "warning": warning}
     _EXECUTOR.submit(_run_scan, job_id, pdf_path, docx_path, flags)
-    return {"job_id": job_id}
+    return {"job_id": job_id, "warning": warning}
 
 
 @router.post("/native")
@@ -235,7 +246,7 @@ async def convert_status(job_id: str):
             raise HTTPException(status_code=404, detail="Задача не найдена.")
         return {"job_id": job_id, "status": job["status"], "stage": job["stage"],
                 "progress": job["progress"], "filename": job["filename"],
-                "error": job["error"]}
+                "error": job["error"], "warning": job.get("warning")}
 
 
 @router.get("/download/{job_id}")

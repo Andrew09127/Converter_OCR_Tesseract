@@ -600,7 +600,7 @@ def test_fix_order_unnumbered_at_end():
 
 #  HIGHLIGHT — кириллический спелл-фиксер (_autofix_word)
 
-from docling_dev.highlight import _autofix_word, _morph
+from docling_dev.highlight import _autofix_word, _morph, _CYR_OCR_PAIRS
 
 # Спелл-фиксер требует словаря pymorphy; без него тесты пропускаем.
 _need_morph = pytest.mark.skipif(_morph is None, reason="pymorphy не установлен")
@@ -2000,3 +2000,67 @@ def test_table_limit_patch_survives_missing_internals():
     cls = type("_FakeNoModel", (_NoModel,), {})
     assert tlim.install_table_seq_limit(cls=cls) is True
     assert cls().multi_table_predict({"tokens": [1, 2]}, [[0, 0, 1, 1]]) is not None
+
+
+#  ПРЕДУПРЕЖДЕНИЕ О ТЕКСТОВОМ СЛОЕ В СКАН-РЕЖИМЕ (п.1.5)
+
+from docling_dev import pdf_classifier as pdfc
+
+
+def test_scan_warning_for_native_pdf(monkeypatch):
+    """Нативный файл в скан-режиме — предупреждаем: OCR перечитает готовый
+    текст заново и может его испортить."""
+    monkeypatch.setattr(pdfc, "classify_pdf",
+                        lambda p: {"suggested": "native", "confidence": "high"})
+    assert pdfc.scan_mode_warning(Path("x.pdf")) == pdfc.SCAN_MODE_TEXT_LAYER_WARNING
+
+
+def test_scan_warning_absent_for_scan(monkeypatch):
+    monkeypatch.setattr(pdfc, "classify_pdf",
+                        lambda p: {"suggested": "scan", "confidence": "high"})
+    assert pdfc.scan_mode_warning(Path("x.pdf")) is None
+
+
+def test_scan_warning_silent_when_unsure(monkeypatch):
+    """При низкой уверенности молчим: ложное предупреждение хуже отсутствия."""
+    monkeypatch.setattr(pdfc, "classify_pdf",
+                        lambda p: {"suggested": "native", "confidence": "low"})
+    assert pdfc.scan_mode_warning(Path("x.pdf")) is None
+
+
+#  РАСШИРЕНИЕ СЛОВАРНОГО СПЕЛЛ-ФИКСА (п.1.Б.4)
+
+@pytest.mark.parametrize("bad,good", [
+    ("правонарущения", "правонарушения"),   # ш/щ
+    ("гофударственной", "государственной"),  # ф/о (через о/с, глубина 2)
+    ("задолженнофть", "задолженность"),
+    ("налогоплателыциков", "налогоплательщиков"),  # ц/щ вместе с ь/ы
+    ("порялка", "порядка"),                 # л/д
+    ("расхолы", "расходы"),
+    ("фелеральным", "федеральным"),
+    ("рещение", "решение"),
+    ("изложенногф", "изложенного"),
+])
+def test_spell_fix_new_pairs(bad, good):
+    """Замеренные на корпусе искажения, которые чинятся однозначно."""
+    assert _autofix_word(bad) == good
+
+
+@pytest.mark.parametrize("word", [
+    "КАРАГЕЗОВА", "КАРАГЕЗОВУ", "СЕМИКАРАКОРСКИЙ",   # фамилии и топонимы в капсе
+    "Геворгян", "Тесёлкин",                           # фамилии с заглавной
+    "самозанятого", "купли-продажи",                  # верные слова вне словаря
+])
+def test_spell_fix_keeps_correct_words(word):
+    """Верные слова спелл-фикс трогать не должен — ни одно из 45 размеченных
+    верных слов корпуса не изменилось."""
+    assert _autofix_word(word) is None
+
+
+def test_spell_fix_refuses_ambiguous():
+    """При двух словарных кандидатах правка не принимается — слово уходит на
+    подсветку, а не чинится наугад. Именно поэтому пара «р/в» отвергнута: с ней
+    у «васстановлен» появлялся второй кандидат «расстановлен», и верная правка
+    «восстановлен» терялась."""
+    assert _autofix_word("васстановлен") == "восстановлен"
+    assert ("р", "в") not in _CYR_OCR_PAIRS and ("в", "р") not in _CYR_OCR_PAIRS

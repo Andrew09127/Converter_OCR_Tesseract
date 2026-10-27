@@ -3583,6 +3583,15 @@ def convert_pdf(
 ) -> bool:
     log.info("  Конвертация: %s", pdf_path.name)
     try:
+        # Пункт 1.5: нативный PDF в скан-режиме — не ошибка, но пользователь
+        # должен знать, что текст будет перечитан заново (и может испортиться).
+        try:
+            from .pdf_classifier import scan_mode_warning
+            _warning = scan_mode_warning(pdf_path)
+        except Exception:                            # noqa: BLE001
+            _warning = None
+        if _warning:
+            log.warning("  ВНИМАНИЕ: %s", _warning)
         # Нативные PDF не нуждаются в EasyOCR для word_order —
         # Docling сам правильно читает порядок блоков из текстового слоя.
         # Это ускоряет конвертацию с ~4 мин до ~10 сек на файл.
