@@ -1935,3 +1935,68 @@ def test_llm_accept_rejects_non_words(orig, cand):
 def test_llm_accept_allows_domain_terms():
     """Доменные слова («взыскателя») словарю pymorphy неизвестны, но верны."""
     assert lcor._accept("взыскагеля", "взыскателя") == "взыскателя"
+
+
+#  ПРЕДЕЛ ДЛИНЫ ПОСЛЕДОВАТЕЛЬНОСТИ TABLEFORMER (п.1.6)
+
+from docling_dev import table_limits as tlim
+
+
+def test_table_seq_cap_floor_and_growth():
+    """Пол защищает разреженные таблицы (мало текста, много пустых ячеек),
+    линейная часть — большие реестры (347 ячеек → предел 726)."""
+    assert tlim.seq_cap(0) == tlim.SEQ_FLOOR
+    assert tlim.seq_cap(18) == tlim.SEQ_FLOOR          # срыв на Артемове был 266
+    assert tlim.seq_cap(102) == 236                    # законная 17x5 даёт 102
+    assert tlim.seq_cap(347) == 726                    # законная 20x3 даёт 115
+    assert tlim.seq_cap(-5) == tlim.SEQ_FLOOR          # мусор на входе не ломает
+
+
+def test_table_seq_cap_covers_measured_corpus():
+    """Ни одна ЗАМЕРЕННАЯ законная последовательность корпуса не обрезается."""
+    # (число текстовых ячеек, фактическая длина последовательности)
+    measured = [(8, 10), (12, 10), (13, 10), (18, 20), (29, 25), (34, 36),
+                (37, 20), (38, 16), (38, 35), (50, 24), (54, 18), (76, 30),
+                (102, 102), (105, 28), (116, 35), (183, 56), (347, 115)]
+    for tokens, seq in measured:
+        assert tlim.seq_cap(tokens) > seq, (tokens, seq)
+
+
+class _FakeModel:
+    def __init__(self):
+        self._max_pred_len = 1024
+
+
+class _FakePredictor:
+    """Заменитель TFPredictor: запоминает предел, с которым его позвали."""
+
+    def __init__(self):
+        self._model = _FakeModel()
+        self.seen = []
+
+    def multi_table_predict(self, page_input, table_bboxes, do_matching=True):
+        self.seen.append(self._model._max_pred_len)
+        return [{"predict_details": {"num_rows": 2, "num_cols": 2}}]
+
+
+def test_table_limit_patch_sets_cap_per_candidate():
+    cls = type("_FakePatched", (_FakePredictor,), {})
+    assert tlim.install_table_seq_limit(cls=cls) is True
+    assert tlim.install_table_seq_limit(cls=cls) is True   # идемпотентно
+    p = cls()
+    p.multi_table_predict({"tokens": [1] * 18}, [[0, 0, 10, 10]])
+    p.multi_table_predict({"tokens": [1] * 102}, [[0, 0, 10, 10]])
+    p.multi_table_predict({}, [[0, 0, 10, 10]])            # кандидат без токенов
+    assert p.seen == [tlim.SEQ_FLOOR, 236, tlim.SEQ_FLOOR]
+
+
+def test_table_limit_patch_survives_missing_internals():
+    """Если устройство предиктора в Docling изменится, конвертация не должна
+    падать: предел просто не ставится."""
+    class _NoModel:
+        def multi_table_predict(self, page_input, table_bboxes, do_matching=True):
+            return [{"predict_details": {}}]
+
+    cls = type("_FakeNoModel", (_NoModel,), {})
+    assert tlim.install_table_seq_limit(cls=cls) is True
+    assert cls().multi_table_predict({"tokens": [1, 2]}, [[0, 0, 1, 1]]) is not None

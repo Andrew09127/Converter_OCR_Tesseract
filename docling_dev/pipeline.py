@@ -167,6 +167,15 @@ def build_converter(
     except Exception as _exc:
         log.debug("ocr_osd недоступен: %s", _exc)
 
+    # TableFormer на грязных сканах срывается в генерации структуры: таблице 4x6
+    # вместо 28 токенов выдаёт 266 и считает её 19 секунд. Предел длины обрезает
+    # только этот мусорный хвост — см. docling_dev/table_limits.py.
+    try:
+        from .table_limits import install_table_seq_limit
+        install_table_seq_limit()
+    except Exception as _exc:
+        log.debug("table_limits недоступен: %s", _exc)
+
     ocr_opts = _tesseract_options(langs)
 
     pipeline_opts = PdfPipelineOptions()
