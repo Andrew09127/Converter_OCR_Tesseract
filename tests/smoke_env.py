@@ -123,6 +123,16 @@ def _morphology() -> dict:
     return item
 
 
+def _ocr_workers() -> int:
+    """Сколько страниц скан-движок распознаёт одновременно (п.2.1): от этого
+    зависит пик памяти — каждая держит свою страницу в 216 DPI."""
+    try:
+        from docling_dev.ocr_parallel import resolve_workers
+        return resolve_workers()
+    except Exception:
+        return 1
+
+
 def _resources() -> list[dict]:
     import psutil
     vm = psutil.virtual_memory()
@@ -134,7 +144,9 @@ def _resources() -> list[dict]:
         {"name": "свободная память", "critical": True,
          "ok": free_ram >= MIN_FREE_RAM_GB,
          "detail": f"{free_ram:.1f} ГБ свободно из {vm.total / 2 ** 30:.0f} ГБ "
-                   f"(минимум {MIN_FREE_RAM_GB} ГБ без LLM, ~3 ГБ с LLM)"},
+                   f"(минимум {MIN_FREE_RAM_GB} ГБ без LLM, ~3 ГБ с LLM; "
+                   f"параллельный OCR — {_ocr_workers()} страниц(ы) разом, "
+                   f"это ещё ~0.1 ГБ на каждую сверх первой)"},
         {"name": "свободный диск", "critical": True,
          "ok": free_disk >= MIN_FREE_DISK_GB,
          "detail": f"{free_disk:.1f} ГБ свободно (минимум {MIN_FREE_DISK_GB} ГБ "

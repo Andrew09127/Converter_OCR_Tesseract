@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -153,7 +154,20 @@ def main() -> None:
              "ПЛОХИХ сканов. По умолчанию ВЫКЛ: помогает шумным/наклонным сканам, но "
              "может портить мелкий текст хороших (CLAHE-артефакты)."
     )
+    parser.add_argument(
+        "--ocr-workers", type=int, default=None, metavar="N",
+        help="Сколько страниц распознавать ОДНОВРЕМЕННО (по умолчанию 4, но не "
+             "больше числа ядер). Ускоряет сканы примерно на треть; каждая "
+             "лишняя страница — это ещё ~100 МБ пика памяти и свой процесс "
+             "tesseract. На слабой машине ставьте 1-2."
+    )
     args = parser.parse_args()
+
+    # Число воркеров OCR передаётся через окружение: его читает
+    # ocr_parallel.resolve_workers, и так флаг не приходится протаскивать
+    # через всю цепочку вызовов до build_converter.
+    if args.ocr_workers is not None:
+        os.environ["CONVERTER_OCR_WORKERS"] = str(args.ocr_workers)
 
     use_word_order = args.word_order
     highlight      = not args.no_highlight

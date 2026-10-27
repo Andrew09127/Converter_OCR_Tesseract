@@ -107,6 +107,11 @@ def _instrument_ocr() -> dict:
 
     c = {k: 0.0 for k in ("osd_s", "tess_s", "clean_s", "render_s")}
     c.update({k: 0 for k in ("osd_n", "tess_n", "clean_n", "render_n")})
+    # Со времён п.2.1 страницы батча распознаются в нескольких потоках, поэтому
+    # `+=` по счётчикам нужен под замком: иначе часть прибавок теряется и замер
+    # врёт в свою пользу. Суммы времён теперь складываются ПО ПОТОКАМ и больше
+    # не равны wall — это нормально, wall считается отдельно.
+    lock = threading.Lock()
 
     def wrap(obj, name, key):
         orig = getattr(obj, name)
@@ -118,8 +123,10 @@ def _instrument_ocr() -> dict:
             try:
                 return orig(*a, **kw)
             finally:
-                c[key + "_n"] += 1
-                c[key + "_s"] += time.perf_counter() - t
+                dt = time.perf_counter() - t
+                with lock:
+                    c[key + "_n"] += 1
+                    c[key + "_s"] += dt
 
         w._perf_wrapped = True           # type: ignore[attr-defined]
         setattr(obj, name, w)

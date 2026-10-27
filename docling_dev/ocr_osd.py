@@ -16,6 +16,11 @@ CPU-секунд на 7-страничный файл, то есть 11% вре�
   * `__call__` — границы документа (у `_perform_osd` нет ссылки на документ,
     поэтому кэш сбрасывается здесь, по смене `ConversionResult`).
 
+Кэш рассчитан на параллельный OCR (`ocr_parallel`): первая проба документа идёт
+под замком, остальные воркеры ждут её и переиспользуют результат. Если кэш
+отключён (страница повёрнута), OSD считается без замка — иначе повёрнутый скан
+сериализовался бы целиком.
+
 ЗАМЕРЕНО И ОТВЕРГНУТО: проставлять в PNG разрешение (pHYs, 216 DPI), чтобы
 убрать «Invalid resolution 0 dpi» — tesseract с известным разрешением меняет
 разбор страницы, и на `Артемов` вывод падал с 995 до 869 слов и с 26 до 16
@@ -134,12 +139,8 @@ def install_osd_cache(cls=None) -> bool:
     orig_osd = getattr(cls, "_osd_orig_perform", None) or cls._perform_osd
     orig_call = getattr(cls, "_osd_orig_call", None) or cls.__call__
 
-    def _perform_osd(self, ifilename: str):
-        cache = getattr(self, "_osd_doc_cache", None)
-        if cache is not None and cache.get("reuse"):
-            with _LOCK:
-                _STATS["osd_reused"] += 1
-            return cache["frame"]
+    def _run_osd(self, ifilename: str):
+        """Честный запуск OSD со счётчиками."""
         try:
             frame = orig_osd(self, ifilename)
         except Exception:
@@ -152,20 +153,43 @@ def install_osd_cache(cls=None) -> bool:
             raise
         with _LOCK:
             _STATS["osd_runs"] += 1
-        if cache is not None:
-            orientation = _orientation_of(frame)
-            cache["frame"] = frame
-            cache["reuse"] = orientation == 0
-            if orientation:
-                log.info("ocr_osd: страница повёрнута на %d° — кэш отключён, "
-                         "OSD будет честно считаться на каждой странице", orientation)
         return frame
+
+    def _perform_osd(self, ifilename: str):
+        cache = getattr(self, "_osd_doc_cache", None)
+        if cache is None:
+            return _run_osd(self, ifilename)
+        # Первую пробу документа держим под замком: при параллельном OCR
+        # (см. ocr_parallel) иначе все воркеры разом увидят пустой кэш и
+        # запустят по процессу OSD вместо одного.
+        with cache["lock"]:
+            if cache["reuse"]:
+                with _LOCK:
+                    _STATS["osd_reused"] += 1
+                return cache["frame"]
+            if not cache["decided"]:
+                frame = _run_osd(self, ifilename)
+                orientation = _orientation_of(frame)
+                cache["frame"] = frame
+                cache["reuse"] = orientation == 0
+                cache["decided"] = True
+                if orientation:
+                    log.info("ocr_osd: страница повёрнута на %d° — кэш отключён "
+                             "на ВЕСЬ документ, OSD будет честно считаться на "
+                             "каждой странице", orientation)
+                return frame
+        # Кэш отключён (в документе есть повёрнутые страницы): считаем честно и
+        # БЕЗ замка, иначе параллельный OCR такого скана сериализуется целиком.
+        # Решение «отключён» не отменяется до конца документа: если одна
+        # страница повёрнута, у остальных ориентация тоже под вопросом.
+        return _run_osd(self, ifilename)
 
     def _call(self, conv_res, page_batch):
         cache = getattr(self, "_osd_doc_cache", None)
         if cache is None or not _same_doc(cache, conv_res):
             self._osd_doc_cache = {"token": _doc_token(conv_res),
-                                   "frame": None, "reuse": False}
+                                   "frame": None, "reuse": False,
+                                   "decided": False, "lock": threading.Lock()}
             with _LOCK:
                 _STATS["docs"] += 1
         return orig_call(self, conv_res, page_batch)

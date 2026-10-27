@@ -127,6 +127,7 @@ def build_converter(
     langs: list[str] | None = None,
     images_scale: float = 2.0,
     ocr_preprocess: bool = False,
+    ocr_workers: int | None = None,
 ) -> DocumentConverter:
     """
     Создаёт DocumentConverter для сканов:
@@ -138,6 +139,12 @@ def build_converter(
     страницу в 216 DPI (scale=3 внутри TesseractOcrCliModel). images_scale задаёт
     разрешение page images (generate_page_images), которые используют word_order
     и ink_bold — 2.0 → 144 DPI, достаточно и не раздувает память.
+
+    ocr_workers — сколько страниц распознавать одновременно (None → по числу
+    ядер, не больше 4, либо CONVERTER_OCR_WORKERS). Каждый воркер держит свою
+    страницу в 216 DPI (~96 МБ) и свой процесс tesseract: пик памяти растёт
+    примерно на 100 МБ за каждую сверхплановую страницу, поэтому на слабых
+    машинах воркеров опускают.
     """
     if langs is None:
         langs = ["ru", "en"]
@@ -156,6 +163,19 @@ def build_converter(
         )
     except Exception as _exc:
         log.debug("ocr_preprocess недоступен: %s", _exc)
+
+    # Страницы батча распознаются параллельно: Docling внутри стадии OCR идёт
+    # по страницам последовательно, то есть один процесс tesseract на всю
+    # машину. Замер: 8 страниц в 216 DPI — 28.5 s в один процесс против 4.9 s в
+    # восемь. Ставится ДО кэша OSD (тот тоже патчит __call__ и должен остаться
+    # снаружи) — порядок модуль соблюдает сам, см. ocr_parallel.
+    workers = 1
+    try:
+        from .ocr_parallel import install_parallel_ocr, resolve_workers
+        workers = resolve_workers(ocr_workers)
+        install_parallel_ocr(workers)
+    except Exception as _exc:
+        log.debug("ocr_parallel недоступен: %s", _exc)
 
     # OSD (ориентация страницы) — один процесс tesseract на документ вместо
     # одного на страницу: 11% времени конвертации уходило на перепроверку одной
@@ -193,6 +213,11 @@ def build_converter(
     pipeline_opts.table_structure_options.mode             = TableFormerMode.ACCURATE
     pipeline_opts.generate_page_images                     = True
     pipeline_opts.images_scale                             = images_scale
+    # Параллельный OCR раздаёт страницы ВНУТРИ батча, поэтому батч стадии OCR
+    # обязан быть не меньше числа воркеров — при батче 1 параллелить нечего.
+    # layout_batch_size и table_batch_size не трогаем: это отдельный пункт
+    # плана (2.2), его нужно перемерить уже с параллельным OCR.
+    pipeline_opts.ocr_batch_size                           = max(workers, 1)
 
     return DocumentConverter(
         format_options={

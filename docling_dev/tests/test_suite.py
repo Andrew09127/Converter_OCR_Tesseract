@@ -2064,3 +2064,400 @@ def test_spell_fix_refuses_ambiguous():
     «восстановлен» терялась."""
     assert _autofix_word("васстановлен") == "восстановлен"
     assert ("р", "в") not in _CYR_OCR_PAIRS and ("в", "р") not in _CYR_OCR_PAIRS
+
+
+#  ПАРАЛЛЕЛЬНЫЙ OCR СТРАНИЦ БАТЧА (п.2.1)
+
+from docling_dev import ocr_parallel
+
+
+def _tsv(words):
+    """Таблица в формате вывода tesseract (только нужные колонки)."""
+    import pandas as pd
+    return pd.DataFrame([
+        {"text": w, "conf": 90, "left": 10 + 20 * i, "top": 30,
+         "width": 18, "height": 12}
+        for i, w in enumerate(words)
+    ])
+
+
+class _FakeBackend:
+    """Номер страницы зашит в ШИРИНУ картинки: при параллельной работе опознать
+    страницу внутри `_run_tesseract` больше нечем — туда приходит только имя
+    временного файла."""
+
+    WIDTH0 = 200
+
+    def __init__(self, no, valid=True):
+        self.no = no
+        self._valid = valid
+
+    def is_valid(self):
+        return self._valid
+
+    def get_page_image(self, scale=1, cropbox=None):
+        from PIL import Image
+        return Image.new("RGB", (self.WIDTH0 + self.no, 60), "white")
+
+
+class _FakePage:
+    def __init__(self, no, valid=True):
+        self.no = no
+        self._backend = _FakeBackend(no, valid)
+
+
+class _FakeRes:
+    """Стенд-ин ConversionResult: нужны timings и input.file (для логов).
+    Слабые ссылки поддерживает — на них держится ключ кэша OSD."""
+
+    def __init__(self):
+        self.timings = {}
+        self.input = types.SimpleNamespace(file="тест.pdf")
+
+
+def _page_of(ifilename):
+    """Какой странице принадлежит временный PNG. Берём БОЛЬШУЮ сторону: при
+    ненулевой ориентации картинка повёрнута и ширина с высотой меняются
+    местами."""
+    from PIL import Image
+    with Image.open(ifilename) as im:
+        return max(im.size) - _FakeBackend.WIDTH0
+
+
+def _ocr_model(pages_words, delays=None, orientation=0, fail_tess=()):
+    """Экземпляр НАСТОЯЩЕГО TesseractOcrCliModel (без __init__) с подменёнными
+    наружными вызовами. Подмена идёт на КЛАССЕ: патчи ocr_osd/ocr_preprocess
+    тоже классовые, а атрибут экземпляра их заслонил бы.
+
+    Сравнение с последовательным проходом сравнивает наш код с кодом Docling,
+    а не с его пересказом в тесте.
+    """
+    import threading
+    import time
+    from docling_core.types.doc import BoundingBox, CoordOrigin
+    from docling.models.stages.ocr.tesseract_ocr_cli_model import (
+        TesseractOcrCliModel,
+    )
+
+    def _perform_osd(self, ifilename):
+        import pandas as pd
+        with self.lock:
+            self.tmp_seen.append(ifilename)
+            self.osd_calls += 1
+        return pd.DataFrame({"key": ["Orientation in degrees"],
+                             "value": [str(orientation)]})
+
+    def _run_tesseract(self, ifilename, df_osd):
+        page_i = _page_of(ifilename)
+        if page_i in fail_tess:
+            import subprocess
+            raise subprocess.CalledProcessError(1, "tesseract", stderr=b"no output")
+        time.sleep((delays or {}).get(page_i, 0.0))
+        return _tsv(pages_words[page_i])
+
+    cls = type("_ParallelSub", (TesseractOcrCliModel,), {
+        "_perform_osd": _perform_osd,
+        "_run_tesseract": _run_tesseract,
+    })
+    m = object.__new__(cls)
+    m.enabled = True
+    m.scale = 3
+    m._is_auto = False
+    m.lock = threading.Lock()
+    m.collected = []                      # (страница, тексты ячеек) в порядке выдачи
+    m.tmp_seen = []                       # какие temp-PNG создавались
+    m.osd_calls = 0
+    m.rect = BoundingBox(l=0, t=0, r=120, b=60,
+                         coord_origin=CoordOrigin.TOPLEFT)
+    m.get_ocr_rects = lambda page: [m.rect]
+    m.post_process_cells = lambda cells, page: m.collected.append(
+        (page.no, [c.text for c in cells]))
+    return cls, m
+
+
+def _run(cls, model, pages, parallel, workers=4, res=None):
+    """Прогоняет батч последовательным кодом Docling или нашим параллельным."""
+    from docling.models.stages.ocr.tesseract_ocr_cli_model import (
+        TesseractOcrCliModel,
+    )
+    res = res or _FakeRes()
+    if parallel:
+        ocr_parallel.install_parallel_ocr(workers, cls=cls)
+        try:
+            return [p.no for p in model(res, iter(pages))]
+        finally:
+            ocr_parallel.uninstall_parallel_ocr(cls)
+    return [p.no for p in TesseractOcrCliModel.__call__(model, res, iter(pages))]
+
+
+@pytest.fixture(autouse=True)
+def _clean_parallel_stats():
+    ocr_parallel.reset_parallel_stats()
+    yield
+
+
+def test_parallel_matches_serial_cells():
+    """Главная проверка: ячейки параллельного прохода совпадают с ячейками
+    последовательного кода Docling — и по странице, и по текстам."""
+    words = {0: ["Иванов", "Иван"], 1: ["Акт", "сверки"], 2: ["итого", "500"]}
+    pages = [_FakePage(i) for i in range(3)]
+
+    cls_s, m_s = _ocr_model(words)
+    _run(cls_s, m_s, pages, parallel=False)
+    cls_p, m_p = _ocr_model(words)
+    _run(cls_p, m_p, pages, parallel=True)
+
+    assert m_s.collected == [(0, ["Иванов", "Иван"]), (1, ["Акт", "сверки"]),
+                             (2, ["итого", "500"])]
+    assert m_p.collected == m_s.collected
+
+
+def test_parallel_cell_geometry_matches_serial():
+    """Координаты, уверенность и индексы ячеек должны совпасть ровно: пересчёт
+    координат зависит от размера картинки, а он теперь едет через фазу А."""
+    words = {0: ["строка"], 1: ["вторая", "третья"]}
+    pages = [_FakePage(i) for i in range(2)]
+
+    def cells(parallel):
+        cls, m = _ocr_model(words)
+        got = []
+        m.post_process_cells = lambda cs, page: got.append(
+            [(c.index, c.text, round(c.confidence, 9),
+              tuple(round(v, 6) for v in c.rect.to_bounding_box().as_tuple()))
+             for c in cs])
+        _run(cls, m, pages, parallel=parallel)
+        return got
+
+    par, ser = cells(True), cells(False)
+    assert par == ser
+    assert par[0] and par[1]                 # ячейки реально собирались
+
+
+def test_parallel_order_is_page_order_not_completion_order():
+    """Первая страница — самая медленная. Порядок выдачи обязан остаться
+    страничным, иначе текст документа перемешается."""
+    words = {0: ["первая"], 1: ["вторая"], 2: ["третья"], 3: ["четвёртая"]}
+    pages = [_FakePage(i) for i in range(4)]
+    cls, m = _ocr_model(words, delays={0: 0.12, 1: 0.06})
+    out = _run(cls, m, pages, parallel=True, workers=4)
+    assert out == [0, 1, 2, 3]
+    assert m.collected == [(0, ["первая"]), (1, ["вторая"]),
+                           (2, ["третья"]), (3, ["четвёртая"])]
+
+
+def test_parallel_really_runs_concurrently():
+    """Доказательство параллелизма: одновременно в работе больше одной
+    страницы. Без этого пункт 2.1 бессмыслен, а тесты выше прошли бы и на
+    последовательном коде."""
+    words = {i: ["слово"] for i in range(4)}
+    pages = [_FakePage(i) for i in range(4)]
+    cls, m = _ocr_model(words, delays={i: 0.05 for i in range(4)})
+    _run(cls, m, pages, parallel=True, workers=4)
+    st = ocr_parallel.parallel_stats()
+    assert st["pages"] == 4
+    assert st["peak_inflight"] > 1
+    assert (st["batches"], st["batches_serial"]) == (1, 0)
+
+
+def test_parallel_single_page_batch_goes_to_original():
+    """Батч из одной страницы параллелить нечего — работу делает код Docling."""
+    cls, m = _ocr_model({0: ["одна"]})
+    out = _run(cls, m, [_FakePage(0)], parallel=True)
+    assert out == [0]
+    assert m.collected == [(0, ["одна"])]
+    st = ocr_parallel.parallel_stats()
+    assert (st["batches"], st["batches_serial"]) == (0, 1)
+
+
+def test_parallel_one_worker_goes_to_original():
+    """Один воркер (слабая машина, фаза 3) — тоже прямой путь Docling."""
+    words = {0: ["а"], 1: ["б"]}
+    cls, m = _ocr_model(words)
+    out = _run(cls, m, [_FakePage(0), _FakePage(1)], parallel=True, workers=1)
+    assert out == [0, 1]
+    assert m.collected == [(0, ["а"]), (1, ["б"])]
+    assert ocr_parallel.parallel_stats()["batches_serial"] == 1
+
+
+def test_parallel_invalid_backend_page_passed_through():
+    """Страница с битым backend отдаётся как есть, без распознавания — так же,
+    как в Docling."""
+    words = {0: ["есть"], 2: ["есть"]}
+    pages = [_FakePage(0), _FakePage(1, valid=False), _FakePage(2)]
+    cls, m = _ocr_model(words)
+    out = _run(cls, m, pages, parallel=True)
+    assert out == [0, 1, 2]
+    assert [no for no, _ in m.collected] == [0, 2]
+
+
+def test_parallel_disabled_model_yields_pages_untouched():
+    cls, m = _ocr_model({0: ["а"], 1: ["б"]})
+    m.enabled = False
+    out = _run(cls, m, [_FakePage(0), _FakePage(1)], parallel=True)
+    assert out == [0, 1]
+    assert m.collected == []
+
+
+def test_parallel_tesseract_failure_skips_rect_not_page():
+    """Падение tesseract на странице — страница всё равно выдаётся (пустой), а
+    не теряется и не рушит конвертацию. Поведение Docling."""
+    words = {0: ["есть"], 1: ["нет"]}
+    pages = [_FakePage(0), _FakePage(1)]
+    cls, m = _ocr_model(words, fail_tess={1})
+    out = _run(cls, m, pages, parallel=True)
+    assert out == [0, 1]
+    assert m.collected == [(0, ["есть"]), (1, [])]
+
+
+def test_parallel_removes_temp_png():
+    """Временные PNG убираются: при 8 воркерах мусор копился бы восьмикратно."""
+    import os
+    words = {i: ["слово"] for i in range(4)}
+    cls, m = _ocr_model(words)
+    _run(cls, m, [_FakePage(i) for i in range(4)], parallel=True)
+    assert len(m.tmp_seen) == 4
+    assert [f for f in m.tmp_seen if os.path.exists(f)] == []
+
+
+def test_parallel_osd_runs_once_under_concurrency():
+    """Кэш OSD обязан пережить параллелизм: восемь страниц разом — всё равно
+    один процесс OSD на документ, а не восемь."""
+    from docling_dev import ocr_osd
+    words = {i: ["слово"] for i in range(8)}
+    pages = [_FakePage(i) for i in range(8)]
+    cls, m = _ocr_model(words, delays={i: 0.02 for i in range(8)})
+    ocr_parallel.install_parallel_ocr(8, cls=cls)
+    ocr_osd.install_osd_cache(cls)       # снаружи, как в build_converter
+    ocr_osd.reset_osd_stats()
+    try:
+        out = [p.no for p in m(_FakeRes(), iter(pages))]
+    finally:
+        ocr_osd.uninstall_osd_cache(cls)
+        ocr_parallel.uninstall_parallel_ocr(cls)
+    assert out == list(range(8))
+    st = ocr_osd.osd_stats()
+    assert (st["osd_runs"], st["osd_reused"], st["docs"]) == (1, 7, 1)
+    assert m.osd_calls == 1              # процесс tesseract запущен ровно раз
+
+
+def test_parallel_osd_rotated_document_not_serialized():
+    """Если страницы повёрнуты, кэш отключён и OSD считается на каждой — но БЕЗ
+    общего замка, иначе параллельный OCR такого скана выродится в
+    последовательный."""
+    from docling_dev import ocr_osd
+    words = {i: ["слово"] for i in range(4)}
+    pages = [_FakePage(i) for i in range(4)]
+    cls, m = _ocr_model(words, orientation=90, delays={i: 0.05 for i in range(4)})
+    ocr_parallel.install_parallel_ocr(4, cls=cls)
+    ocr_osd.install_osd_cache(cls)
+    ocr_osd.reset_osd_stats()
+    ocr_parallel.reset_parallel_stats()
+    try:
+        out = [p.no for p in m(_FakeRes(), iter(pages))]
+    finally:
+        ocr_osd.uninstall_osd_cache(cls)
+        ocr_parallel.uninstall_parallel_ocr(cls)
+    assert out == list(range(4))
+    assert ocr_osd.osd_stats()["osd_runs"] == 4        # честно на каждой
+    assert ocr_parallel.parallel_stats()["peak_inflight"] > 1
+
+
+def test_parallel_install_puts_osd_outside():
+    """Патч OSD ставит границы документа в __call__ и должен остаться СНАРУЖИ
+    нашего. Если ocr_parallel поставили вторым, он сам переустанавливает OSD —
+    иначе кэш не создаётся и OSD считается на каждой странице."""
+    from docling_dev import ocr_osd
+    words = {i: ["слово"] for i in range(4)}
+    pages = [_FakePage(i) for i in range(4)]
+    cls, m = _ocr_model(words)
+    ocr_osd.install_osd_cache(cls)                   # СНАЧАЛА OSD
+    ocr_parallel.install_parallel_ocr(4, cls=cls)    # потом параллельный OCR
+    ocr_osd.reset_osd_stats()
+    try:
+        list(m(_FakeRes(), iter(pages)))
+    finally:
+        ocr_osd.uninstall_osd_cache(cls)
+        ocr_parallel.uninstall_parallel_ocr(cls)
+    assert ocr_osd.osd_stats()["docs"] == 1          # границы документа нашлись
+    assert ocr_osd.osd_stats()["osd_runs"] == 1
+
+
+def test_parallel_osd_cache_reset_between_documents():
+    """Новый документ — новая проба OSD, и при параллельном OCR тоже."""
+    from docling_dev import ocr_osd
+    words = {i: ["слово"] for i in range(3)}
+    pages = [_FakePage(i) for i in range(3)]
+    cls, m = _ocr_model(words)
+    ocr_parallel.install_parallel_ocr(3, cls=cls)
+    ocr_osd.install_osd_cache(cls)
+    ocr_osd.reset_osd_stats()
+    doc1, doc2 = _FakeRes(), _FakeRes()      # держим живыми: адреса не совпадут
+    try:
+        list(m(doc1, iter(pages)))
+        list(m(doc2, iter(pages)))
+    finally:
+        ocr_osd.uninstall_osd_cache(cls)
+        ocr_parallel.uninstall_parallel_ocr(cls)
+    st = ocr_osd.osd_stats()
+    assert (st["docs"], st["osd_runs"]) == (2, 2)
+
+
+def test_parallel_uninstall_restores_original():
+    cls, _m = _ocr_model({0: ["а"]})
+    orig = cls.__call__
+    assert ocr_parallel.install_parallel_ocr(4, cls=cls) is True
+    assert cls.__call__ is not orig
+    assert ocr_parallel.uninstall_parallel_ocr(cls) is True
+    assert cls.__call__ is orig
+    assert ocr_parallel.uninstall_parallel_ocr(cls) is False
+
+
+def test_parallel_install_idempotent():
+    """Повторная установка с тем же числом воркеров не наслаивает обёртки."""
+    cls, _m = _ocr_model({0: ["а"]})
+    orig = cls.__call__
+    ocr_parallel.install_parallel_ocr(4, cls=cls)
+    first = cls.__call__
+    assert ocr_parallel.install_parallel_ocr(4, cls=cls) is True
+    assert cls.__call__ is first
+    ocr_parallel.install_parallel_ocr(2, cls=cls)    # другое число — переустановка
+    assert cls.__call__ is not first
+    assert cls._parallel_orig_call is orig           # оригинал не потерян
+    ocr_parallel.uninstall_parallel_ocr(cls)
+    assert cls.__call__ is orig
+
+
+@pytest.mark.parametrize("env,expected", [
+    ("", None),              # по числу ядер, считается отдельно
+    ("4", 4),
+    ("1", 1),
+    ("0", 1),                # ноль воркеров бессмыслен
+    ("-3", 1),
+    ("999", ocr_parallel.HARD_MAX_WORKERS),
+    ("мусор", None),
+])
+def test_parallel_resolve_workers_env(monkeypatch, env, expected):
+    """Число воркеров обязано настраиваться: фаза 3 ограничивает его на слабых
+    машинах, а мусор в переменной не должен ронять конвертацию."""
+    import os
+    monkeypatch.setenv("CONVERTER_OCR_WORKERS", env)
+    got = ocr_parallel.resolve_workers()
+    if expected is None:
+        assert got == min(ocr_parallel.DEFAULT_MAX_WORKERS, os.cpu_count() or 1)
+    else:
+        assert got == expected
+
+
+def test_parallel_resolve_workers_argument_wins(monkeypatch):
+    monkeypatch.setenv("CONVERTER_OCR_WORKERS", "8")
+    assert ocr_parallel.resolve_workers(2) == 2
+
+
+def test_parallel_ocr_batch_size_follows_workers():
+    """Без подъёма ocr_batch_size параллелить нечего: Docling отдаёт стадии OCR
+    по 4 страницы, и восемь воркеров половину времени простаивали бы."""
+    import inspect
+    from docling_dev import pipeline
+    src = inspect.getsource(pipeline.build_converter)
+    assert "pipeline_opts.ocr_batch_size" in src
+    assert "resolve_workers" in src
