@@ -3380,3 +3380,103 @@ def test_analyze_still_works_on_normal_pdf(errors_client, pdfs):
                         files={"file": ("ok.pdf", f, "application/pdf")})
     assert r.status_code == 200
     assert r.json()["suggested"] in ("scan", "native")
+
+
+#  ГОТОВНОСТЬ ОКРУЖЕНИЯ: GET /convert/health (п.4.3)
+
+
+@pytest.fixture
+def health_client():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from docling_dev import api as dev_api
+    dev_api._HEALTH_CACHE.update(at=0.0, report=None)
+    app = FastAPI()
+    app.include_router(dev_api.router)
+    yield TestClient(app), dev_api
+    dev_api._HEALTH_CACHE.update(at=0.0, report=None)
+
+
+def test_health_reports_environment(health_client):
+    """Готовность окружения одним ответом: «почему не работает» до конвертации."""
+    client, _ = health_client
+    r = client.get("/convert/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert isinstance(body["ready"], bool)
+    names = {i["name"] for i in body["items"]}
+    assert {"tesseract", "модели Docling", "свободная память",
+            "свободный диск"} <= names
+    for i in body["items"]:
+        assert set(i) >= {"name", "ok", "critical", "detail"}
+    assert body["profile"]["profile"] in ("lean", "balanced", "full")
+    assert body["warmup"] in ("cold", "warming", "ready", "failed", "skipped")
+
+
+def test_health_is_200_even_when_not_ready(health_client, monkeypatch):
+    """503 выглядел бы естественнее, но health-цикл обёртки в sberAct решит по
+    нему, что сайдкар не поднялся, и убьёт его. Надо ответить и объяснить."""
+    client, _ = health_client
+    monkeypatch.setattr("docling_dev.health.check_environment",
+                        lambda deep=False: {"ready": False,
+                                            "items": [{"name": "tesseract",
+                                                       "ok": False,
+                                                       "critical": True,
+                                                       "detail": "не запускается"}],
+                                            "problems": ["tesseract"]})
+    r = client.get("/convert/health")
+    assert r.status_code == 200
+    assert r.json()["ready"] is False
+    assert r.json()["problems"] == ["tesseract"]
+
+
+def test_health_is_cached(health_client, monkeypatch):
+    """Внутри два запуска tesseract.exe, а маршрут опрашивают в цикле."""
+    client, _ = health_client
+    calls = []
+    monkeypatch.setattr("docling_dev.health.check_environment",
+                        lambda deep=False: calls.append(deep) or
+                        {"ready": True, "items": [], "problems": []})
+    client.get("/convert/health")
+    client.get("/convert/health")
+    assert calls == [False]                      # второй ответ — из кэша
+    client.get("/convert/health?refresh=true")
+    assert calls == [False, False]               # и всегда deep=False
+
+
+def test_health_never_assembles_llm_model(monkeypatch):
+    """ВАЖНО: `_resolve_model` при отсутствии собранного файла СКЛЕИВАЕТ gguf
+    из кусков — это гигабайты записи. Ответ на запрос такого делать не должен."""
+    from docling_dev import health
+
+    def boom(_path):
+        raise AssertionError("health не имеет права собирать модель из кусков")
+
+    monkeypatch.setattr("docling_dev.llm_correct._resolve_model", boom)
+    rep = health.check_environment(deep=False)    # не бросает
+    assert "ready" in rep
+
+
+def test_health_quick_mode_does_not_import_llama(monkeypatch):
+    """`import llama_cpp` тянет DLL и остаётся в памяти навсегда — проверять
+    наличие пакета надо через find_spec."""
+    import inspect
+    from docling_dev import health
+    src = inspect.getsource(health._llm_model)
+    deep_branch, quick_branch = src.split("else:", 1)
+    assert "import llama_cpp" not in quick_branch
+    assert "find_spec" in quick_branch
+
+
+def test_smoke_env_reuses_the_same_checks():
+    """Одна реализация, два потребителя: CLI-проверка и эндпоинт. Расхождение
+    между ними означало бы, что `run_phase` проверяет не то, что видит
+    пользователь."""
+    import sys
+    tests_dir = str(ROOT / "tests")
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+    import smoke_env
+    from docling_dev import health
+    assert smoke_env.check_environment is health.check_environment
+    assert smoke_env.REQUIRED_LANGS == health.REQUIRED_LANGS

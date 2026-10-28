@@ -56,6 +56,11 @@ _WORK_DIR.mkdir(parents=True, exist_ok=True)
 _SCAN_CONVERTERS: dict[bool, object] = {}
 _SCAN_LOCK = threading.Lock()
 
+# Кэш ответа /convert/health: проверка дешёвая (~0.1 s), но health-цикл
+# обёртки опрашивает её в цикле, а внутри — два запуска tesseract.exe.
+_HEALTH_CACHE: dict = {"at": 0.0, "report": None}
+_HEALTH_TTL = 10.0
+
 # Кэш OCR-reader (Tesseract): нужен только для флага word_order
 # (переупорядочивание блоков). Строим лениво один раз.
 _OCR_READER: list = []          # [reader] или [] ; None-маркер недоступности — [None]
@@ -288,6 +293,37 @@ async def convert_profile():
         "ram_gb": round(m["ram_gb"], 1),
         "free_gb": round(m["free_gb"], 1),
     }
+
+
+@router.get("/health")
+async def convert_health(refresh: bool = False):
+    """Готовность окружения одним ответом (пункт 4.3).
+
+    Что проверяется: tesseract и языки rus/eng/osd, собранные модели Docling,
+    gguf-модель LLM, словарь морфологии, свободные память и диск. Плюс
+    выбранный ресурсный профиль и состояние прогрева.
+
+    ОТВЕТ ВСЕГДА 200, даже когда `ready: false`. Код 503 выглядел бы
+    естественнее, но health-цикл обёртки в sberAct по нему решит, что сайдкар
+    не поднялся, и убьёт его — а нам надо наоборот: ответить и объяснить, чего
+    не хватает. Критичность каждой строки — в поле `critical`.
+
+    Результат кэшируется на 10 секунд (`refresh=true` — посчитать заново):
+    внутри два запуска tesseract.exe, а опрашивают этот маршрут в цикле.
+    """
+    import time
+    from .health import check_environment
+    now = time.monotonic()
+    report = _HEALTH_CACHE["report"]
+    if refresh or report is None or now - _HEALTH_CACHE["at"] > _HEALTH_TTL:
+        # deep=False обязательно: иначе проверка импортирует llama-cpp и может
+        # СКЛЕИТЬ gguf-модель из кусков — ответ на запрос такого делать не должен.
+        report = check_environment(deep=False)
+        _HEALTH_CACHE.update(at=now, report=report)
+        if not report["ready"]:
+            log.warning("health: окружение не готово — %s",
+                        ", ".join(report["problems"]))
+    return report
 
 
 @router.post("/warmup")
