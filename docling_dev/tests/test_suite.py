@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 import json
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -3628,3 +3629,229 @@ def test_restore_runs_once(jobs_disk, monkeypatch):
     client.get("/convert/status/задача-8")
     client.get("/convert/status/нет-такой")
     assert len(calls) == 1
+
+
+#  ОТМЕНА ЗАДАЧИ И СРОК ВЫПОЛНЕНИЯ (п.4.6)
+
+
+@pytest.fixture
+def clean_abort():
+    """Состояние прерывания модульное — обязательно снимать за собой: иначе
+    следующая задача прекратится сразу же, за чужой счёт."""
+    from docling_dev import abort
+    abort.finish()
+    yield abort
+    abort.finish()
+
+
+def test_abort_request_raises_on_check(clean_abort):
+    from docling_dev.errors import JobAborted
+    clean_abort.start(None)
+    clean_abort.check()                          # пока не просили — тихо
+    clean_abort.request("CANCELLED", "кнопка")
+    assert clean_abort.requested() == "CANCELLED"
+    with pytest.raises(JobAborted) as exc:
+        clean_abort.check()
+    assert exc.value.code == "CANCELLED"
+
+
+def test_abort_deadline_becomes_timeout(clean_abort):
+    """Срок считается в той же проверке: отдельный таймер потребовал бы ещё
+    одного потока, а проверка и так зовётся на каждой странице."""
+    from docling_dev.errors import JobAborted
+    clean_abort.start(0.001)
+    time.sleep(0.01)
+    with pytest.raises(JobAborted) as exc:
+        clean_abort.check()
+    assert exc.value.code == "TIMEOUT"
+    assert clean_abort.requested() == "TIMEOUT"
+
+
+def test_abort_finish_clears_request(clean_abort):
+    """Главная опасность модульного состояния: запрос, доставшийся следующей
+    задаче в наследство."""
+    clean_abort.request("CANCELLED")
+    clean_abort.finish()
+    assert clean_abort.requested() is None
+    clean_abort.check()                          # не бросает
+
+
+def test_abort_check_runs_before_stage_work(clean_abort):
+    """СМЫСЛ ВСЕГО ПУНКТА: проверка стоит ДО работы стадии. Если пустить
+    стадию работать, отмена не экономит времени — замерено на настоящем
+    скане: проверка только на границе страницы давала 21 s вместо 22 s."""
+    worked = []
+
+    class FakeStage:
+        def __call__(self, conv_res, page_batch):
+            worked.append(True)
+            yield from page_batch
+
+    clean_abort.install_abort_checks([FakeStage])
+    try:
+        stage = FakeStage()
+        assert list(stage(None, ["стр1"])) == ["стр1"]
+        assert worked == [True]
+        clean_abort.request("CANCELLED")
+        from docling_dev.errors import JobAborted
+        with pytest.raises(JobAborted):
+            list(stage(None, ["стр2"]))
+        assert worked == [True]                  # работа НЕ началась
+    finally:
+        clean_abort.uninstall_abort_checks([FakeStage])
+
+
+def test_abort_install_is_idempotent_and_reversible(clean_abort):
+    class FakeStage:
+        def __call__(self, conv_res, page_batch):
+            yield from page_batch
+
+    original = FakeStage.__call__
+    assert clean_abort.install_abort_checks([FakeStage]) == 1
+    assert clean_abort.install_abort_checks([FakeStage]) == 1   # повтор — no-op
+    assert FakeStage.__call__ is not original
+    assert clean_abort.uninstall_abort_checks([FakeStage]) == 1
+    assert FakeStage.__call__ is original
+
+
+def test_progress_lets_abort_through_but_eats_other_errors(clean_abort):
+    """Счётчик страниц глушит ошибки подписчика — но прерывание обязано
+    пройти наружу, иначе отменить задачу нечем."""
+    from docling_dev import progress
+    from docling_dev.errors import JobAborted
+
+    def boom(done, total):
+        raise RuntimeError("подписчик сломался")
+
+    progress.start(3, boom)
+    try:
+        progress.page_done()                     # не бросает
+    finally:
+        progress.finish()
+
+    def cancel(done, total):
+        raise JobAborted("CANCELLED", "пора")
+
+    progress.start(3, cancel)
+    try:
+        with pytest.raises(JobAborted):
+            progress.page_done()
+    finally:
+        progress.finish()
+
+
+def test_classify_maps_job_aborted_to_its_code():
+    from docling_dev.errors import JobAborted, classify
+    err = classify(JobAborted("TIMEOUT", "истёк срок"))
+    assert err.code == "TIMEOUT"
+    assert "истёк срок" in err.detail
+
+
+@pytest.mark.parametrize("env,expected", [
+    (None, 1800.0),
+    ("60", 60.0),
+    ("0", 0.0),
+    ("ерунда", 1800.0),
+])
+def test_job_timeout_from_env(monkeypatch, env, expected):
+    """Срок — защита от зависания, а не лимит скорости: по умолчанию полчаса,
+    заведомо больше любой нормальной работы на файлах до 20 страниц."""
+    from docling_dev import api as dev_api
+    if env is None:
+        monkeypatch.delenv("CONVERTER_JOB_TIMEOUT_S", raising=False)
+    else:
+        monkeypatch.setenv("CONVERTER_JOB_TIMEOUT_S", env)
+    assert dev_api._job_timeout_s() == expected
+
+
+@pytest.fixture
+def cancel_client(clean_abort):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from docling_dev import api as dev_api
+
+    app = FastAPI()
+    app.include_router(dev_api.router)
+    saved = dict(dev_api._JOBS)
+    yield TestClient(app), dev_api
+    dev_api._JOBS.clear()
+    dev_api._JOBS.update(saved)
+    dev_api._FUTURES.clear()
+
+
+def _put_job(dev_api, job_id, **changes):
+    job = {"status": "running", "stage": "Страница 1 из 3", "progress": 0.4,
+           "mode": "scan", "filename": "ф.docx", "docx_path": "", "error": None}
+    job.update(changes)
+    with dev_api._JOBS_LOCK:
+        dev_api._JOBS[job_id] = job
+    return job
+
+
+def test_cancel_unknown_job_is_404(cancel_client):
+    client, _ = cancel_client
+    assert client.post("/convert/cancel/нет-такой").status_code == 404
+
+
+def test_cancel_finished_job_is_409(cancel_client):
+    client, dev_api = cancel_client
+    _put_job(dev_api, "готовая", status="done", stage="Готово")
+    assert client.post("/convert/cancel/готовая").status_code == 409
+
+
+def test_cancel_queued_job_removes_it_from_queue(cancel_client, monkeypatch):
+    """Задачу, которая ещё не начиналась, снимает сам исполнитель — это
+    единственный надёжный способ её не делать."""
+    client, dev_api = cancel_client
+    _put_job(dev_api, "в-очереди", status="queued", stage="В очереди…")
+
+    class FakeFuture:
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+            return True
+
+    fut = FakeFuture()
+    dev_api._FUTURES["в-очереди"] = fut
+    r = client.post("/convert/cancel/в-очереди")
+    assert r.status_code == 200
+    assert r.json()["state"] == "cancelled"
+    assert fut.cancelled
+    st = client.get("/convert/status/в-очереди").json()
+    assert st["status"] == "error"
+    assert st["error_code"] == "CANCELLED"
+    assert st["stage"] == "Отменено"
+
+
+def test_cancel_running_scan_requests_abort(cancel_client):
+    """Поток убить нельзя, поэтому 202: остановимся на ближайшей проверке."""
+    client, dev_api = cancel_client
+    _put_job(dev_api, "идёт")
+    r = client.post("/convert/cancel/идёт")
+    assert r.status_code == 202
+    assert r.json()["state"] == "cancelling"
+    from docling_dev import abort
+    assert abort.requested() == "CANCELLED"
+
+
+def test_cancel_running_native_is_honest_409(cancel_client):
+    """pdf2docx — внешний чёрный ящик, точек проверки внутри нет. Врать, что
+    отменили, нельзя."""
+    client, dev_api = cancel_client
+    _put_job(dev_api, "нативная", mode="native", stage="Конвертация PDF…")
+    r = client.post("/convert/cancel/нативная")
+    assert r.status_code == 409
+    assert "pdf2docx" in r.json()["detail"]
+    from docling_dev import abort
+    assert abort.requested() is None             # чужую задачу не прерываем
+
+
+def test_cancel_running_polish_is_honest_409(cancel_client):
+    """Доочистка — один вызов модели, прерывать её тоже нечем."""
+    client, dev_api = cancel_client
+    _put_job(dev_api, "доочистка", stage="Доочистка текста…")
+    r = client.post("/convert/cancel/доочистка")
+    assert r.status_code == 409
+    assert "модели" in r.json()["detail"]

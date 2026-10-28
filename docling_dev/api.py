@@ -49,6 +49,28 @@ _JOBS_LOCK = threading.Lock()
 # Один воркер — задачи идут по очереди (сериализация прогонов).
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="convert")
 
+# job_id → Future. Нужен для отмены (п.4.6): задачу, которая ещё не начиналась,
+# снимает сам исполнитель, и это единственный надёжный способ её не делать.
+_FUTURES: dict = {}
+
+# Срок на задачу: защита от зависания, а не ограничение по скорости. Файлы у
+# нас до 20 страниц (~10 s на страницу в худшем случае), поэтому полчаса —
+# это заведомо больше любой нормальной работы. 0 — без срока.
+_DEFAULT_TIMEOUT_S = 1800.0
+
+
+def _job_timeout_s() -> float:
+    """Срок на задачу, CONVERTER_JOB_TIMEOUT_S в секундах (0 — выключить)."""
+    raw = os.environ.get("CONVERTER_JOB_TIMEOUT_S", "").strip()
+    if not raw:
+        return _DEFAULT_TIMEOUT_S
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        log.warning("api: CONVERTER_JOB_TIMEOUT_S=%r — не число, беру %s s",
+                    raw, _DEFAULT_TIMEOUT_S)
+        return _DEFAULT_TIMEOUT_S
+
 # Рабочая папка задач (вход PDF + выход DOCX) в системном temp. НЕ чистится:
 # рядом с каждым PDF/DOCX лежит `job.json`, по которому задачи восстанавливаются
 # после перезапуска сервера (п.4.5).
@@ -262,8 +284,9 @@ def _page_count(pdf_path: Path) -> int:
 
 def _run_scan(job_id: str, pdf_path: Path, docx_path: Path, flags: dict) -> None:
     """Прогон скана через Docling-пайплайн (медленный путь)."""
-    from . import progress as page_progress
+    from . import abort, progress as page_progress
     from .errors import ConvertError, classify
+    aborted = None
     try:
         _set(job_id, status="running", stage="Анализ скана…", progress=0.1)
         converter = _get_scan_converter(flags["ocr_preprocess"])
@@ -287,6 +310,9 @@ def _run_scan(job_id: str, pdf_path: Path, docx_path: Path, flags: dict) -> None
         # файле в 7 страниц), поэтому текст должен объяснять, чего ждём.
         _set(job_id, stage="Распознавание страниц…", progress=_PROGRESS_FROM)
         page_progress.start(total, _on_page)
+        # Пункт 4.6: отмена и срок. Проверки стоят на входе в каждую тяжёлую
+        # стадию конвейера — иначе прерывание не экономит времени (замерено).
+        abort.start(_job_timeout_s())
         from . import convert_pdf_checked
         try:
             convert_pdf_checked(
@@ -298,8 +324,11 @@ def _run_scan(job_id: str, pdf_path: Path, docx_path: Path, flags: dict) -> None
                 ink_bold=flags["ink_bold"],
             )
         finally:
-            # Обязательно: иначе следующая задача досчитает страницы в эту.
+            # Обязательно: иначе следующая задача досчитает страницы в эту,
+            # а запрос на отмену достанется ей в наследство.
             page_progress.finish()
+            aborted = abort.requested()
+            abort.finish()
         if docx_path.exists():
             _set(job_id, status="done", stage="Готово", progress=1.0)
         else:
@@ -307,8 +336,16 @@ def _run_scan(job_id: str, pdf_path: Path, docx_path: Path, flags: dict) -> None
             _fail(job_id, ConvertError("INTERNAL",
                                        "DOCX не создан, хотя ошибки не было"))
     except Exception as exc:                     # noqa: BLE001 — отдаём текст клиенту
-        log.exception("api: ошибка прогона скана %s", job_id)
-        _fail(job_id, classify(exc))
+        # Если прерывание просили мы сами, причина известна точно: разбирать
+        # текст ошибки Docling (он завершает прогон как FAILURE) незачем.
+        if aborted:
+            log.info("api: задача %s прекращена (%s)", job_id, aborted)
+            _fail(job_id, ConvertError(aborted))
+            _set(job_id, stage=("Отменено" if aborted == "CANCELLED"
+                                else "Превышен срок"))
+        else:
+            log.exception("api: ошибка прогона скана %s", job_id)
+            _fail(job_id, classify(exc))
 
 
 def _run_native(job_id: str, pdf_path: Path, docx_path: Path) -> None:
@@ -529,7 +566,8 @@ async def convert_scan(
     with _JOBS_LOCK:
         _JOBS[job_id] = job
     _write_job(job_id, dict(job))
-    _EXECUTOR.submit(_run_scan, job_id, pdf_path, docx_path, flags)
+    _FUTURES[job_id] = _EXECUTOR.submit(_run_scan, job_id, pdf_path,
+                                        docx_path, flags)
     return {"job_id": job_id, "warning": warning}
 
 
@@ -543,8 +581,60 @@ async def convert_native(file: UploadFile = File(...)):
     with _JOBS_LOCK:
         _JOBS[job_id] = job
     _write_job(job_id, dict(job))
-    _EXECUTOR.submit(_run_native, job_id, pdf_path, docx_path)
+    _FUTURES[job_id] = _EXECUTOR.submit(_run_native, job_id, pdf_path, docx_path)
     return {"job_id": job_id}
+
+
+@router.post("/cancel/{job_id}")
+async def convert_cancel(job_id: str, response: Response):
+    """Отменить задачу (пункт 4.6).
+
+    Два случая, и они ведут себя по-разному:
+      • задача ещё НЕ НАЧИНАЛАСЬ — снимается с исполнителя, работы не будет
+        вовсе, статус сразу `error` с кодом `CANCELLED`;
+      • задача УЖЕ ИДЁТ — поток убить нельзя, поэтому прерывание кооперативное:
+        проверки стоят на входе в каждую тяжёлую стадию конвейера. Отвечаем 202,
+        итог приходит обычным `GET /convert/status`. Замер на 3-страничном
+        скане: отмена на 3-й секунде — прогон закончился на 7.4 s вместо 22 s.
+
+    Нативный режим (pdf2docx) и доочистка LLM прерываются ТОЛЬКО пока стоят в
+    очереди: это внешний чёрный ящик и один вызов модели соответственно, точек
+    проверки внутри них нет. На идущей такой задаче отвечаем 409 честно.
+    """
+    from . import abort
+    from .errors import ConvertError
+    _ensure_restored()
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Задача не найдена.")
+        if job["status"] in ("done", "error"):
+            raise HTTPException(status_code=409,
+                                detail="Задача уже завершена — отменять нечего.")
+        mode = job.get("mode")
+        stage = job.get("stage", "")
+
+    future = _FUTURES.get(job_id)
+    if future is not None and future.cancel():
+        # Сняли из очереди: воркер её даже не начнёт, статус ставим здесь.
+        _fail(job_id, ConvertError("CANCELLED", "снята из очереди до начала"))
+        _set(job_id, stage="Отменено")
+        log.info("api: задача %s снята из очереди", job_id)
+        return {"job_id": job_id, "state": "cancelled"}
+
+    polishing = stage.startswith("Доочистка")
+    if mode != "scan" or polishing:
+        raise HTTPException(
+            status_code=409,
+            detail=("Эту работу нельзя прервать на ходу: "
+                    + ("доочистка — один вызов модели."
+                       if polishing else
+                       "нативный режим идёт внутри pdf2docx.")
+                    + " Дождитесь завершения."))
+
+    abort.request("CANCELLED", f"отмена задачи {job_id}")
+    response.status_code = 202
+    return {"job_id": job_id, "state": "cancelling"}
 
 
 @router.get("/status/{job_id}")
@@ -638,7 +728,7 @@ async def convert_polish(job_id: str):
                    error=None)
     if not docx_path.exists():
         raise HTTPException(status_code=410, detail="Результат недоступен.")
-    _EXECUTOR.submit(_run_polish, job_id, docx_path)
+    _FUTURES[job_id] = _EXECUTOR.submit(_run_polish, job_id, docx_path)
     return {"job_id": job_id, "status": "queued"}
 
 

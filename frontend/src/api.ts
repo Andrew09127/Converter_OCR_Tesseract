@@ -128,6 +128,16 @@ export async function getProfile(): Promise<MachineProfile> {
   return (await res.json()) as MachineProfile;
 }
 
+// Отменяет задачу (п.4.6). Задачу из очереди снимает сразу, идущий скан
+// прекращает на ближайшей проверке — итог приходит обычным опросом статуса.
+// Нативный режим и доочистку на ходу прервать нельзя: сервер честно отвечает
+// 409, и это не ошибка пользователя, а свойство pdf2docx и одного вызова LLM.
+export async function cancelJob(jobId: string): Promise<"cancelled" | "cancelling"> {
+  const res = await send(`/convert/cancel/${jobId}`, { method: "POST" });
+  if (!res.ok) throw await failure(res, "Отмена не удалась");
+  return (await res.json()).state as "cancelled" | "cancelling";
+}
+
 // Догоняет уже готовый DOCX LLM-доочисткой (п.3.2): распознавание не
 // повторяется, работа идёт по сохранённым в файле жёлтым подсветкам.
 export async function startPolish(jobId: string): Promise<void> {

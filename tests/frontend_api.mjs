@@ -129,6 +129,20 @@ try {
         e.message.includes("перезапустите программу"), e.message);
 }
 
+// ── отмена задачи (п.4.6) ───────────────────────────────────────────────────
+mock(() => json(200, { job_id: "x", state: "cancelling" }));
+check("отмена идущей задачи", (await api.cancelJob("x")) === "cancelling");
+mock(() => json(200, { job_id: "x", state: "cancelled" }));
+check("снятие из очереди", (await api.cancelJob("x")) === "cancelled");
+mock(() => json(409, { detail: "Эту работу нельзя прервать на ходу: нативный режим идёт внутри pdf2docx. Дождитесь завершения." }));
+try {
+  await api.cancelJob("x");
+  check("409 на отмене → ошибка", false);
+} catch (e) {
+  check("409 на отмене → текст сервера, а не наш",
+        e.message.includes("pdf2docx") && e.kind === "http", e.message);
+}
+
 // ── готовность окружения (п.4.3) ────────────────────────────────────────────
 mock(() => json(200, { ready: false, problems: ["tesseract"], items: [] }));
 const h = await api.getHealth();

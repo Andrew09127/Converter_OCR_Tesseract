@@ -73,6 +73,9 @@ MESSAGES: dict[str, tuple[str, str]] = {
         "Конвертация прервана: программа была перезапущена.",
         "Загрузите файл и запустите конвертацию заново — незавершённая работа "
         "не продолжается после перезапуска."),
+    "CANCELLED": (
+        "Конвертация отменена.",
+        "Файл не изменён. Запустите снова, когда будет удобно."),
     "TIMEOUT": (
         "Конвертация не уложилась в отведённое время.",
         "Попробуйте разделить документ на части по 10-15 страниц."),
@@ -104,6 +107,23 @@ class ConvertError(Exception):
     def text(self) -> str:
         """Одной строкой — для поля `error`, которое интерфейс уже показывает."""
         return " ".join(p for p in (self.message, self.hint) if p)
+
+
+class JobAborted(Exception):
+    """Задачу надо прекратить: отмена пользователем или истёкший срок (п.4.6).
+
+    Поток с конвертацией убить нельзя — Docling работает одним блокирующим
+    вызовом. Поэтому прерывание кооперативное: проверка стоит на границе
+    страницы (там, где считается прогресс), и отсюда летит это исключение.
+    Наследуется от Exception, а не от ConvertError: по пути наружу его ловит и
+    переводит в код только `convert_pdf_checked`, а промежуточные `except
+    Exception` в Docling его просто пропускают дальше.
+    """
+
+    def __init__(self, code: str = "CANCELLED", detail: str = "") -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"[{code}] {detail}" if detail else f"[{code}]")
 
 
 def _looks_like(text: str, *needles: str) -> bool:
@@ -182,6 +202,8 @@ def classify(exc: BaseException) -> ConvertError:
     """
     if isinstance(exc, ConvertError):
         return exc
+    if isinstance(exc, JobAborted):
+        return ConvertError(exc.code, exc.detail)
 
     text = f"{type(exc).__name__}: {exc}"
 

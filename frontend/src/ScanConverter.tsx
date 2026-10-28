@@ -26,6 +26,7 @@ import {
   MachineProfile,
   ScanFlags,
   analyzePdf,
+  cancelJob,
   downloadResult,
   getHealth,
   getProfile,
@@ -118,6 +119,8 @@ export default function ScanConverter() {
   // Связь с сервером потеряна, идут повторы опроса (п.4.4). Не ошибка: задача
   // на сервере, скорее всего, продолжает идти.
   const [trouble, setTrouble] = useState<string | null>(null);
+  // Идущая задача: по ней доступна отмена (п.4.6).
+  const [activeJob, setActiveJob] = useState<string | null>(null);
   // Готовая скан-задача: по ней доступна доочистка текста (п.3.2).
   const [doneJob, setDoneJob] = useState<{ id: string; filename: string } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -189,6 +192,7 @@ export default function ScanConverter() {
     setStatus("Загрузка файла…");
     try {
       const jobId = await startConversion(mode, file, mode === "scan" ? flags : undefined);
+      setActiveJob(jobId);
       const final = await pollUntilDone(
         jobId,
         (s) => {
@@ -207,6 +211,11 @@ export default function ScanConverter() {
         if (mode === "scan" && !flags.iim && !final.polished) {
           setDoneJob({ id: jobId, filename: final.filename });
         }
+      } else if (final.error_code === "CANCELLED") {
+        // Отмену просил сам пользователь — это не ошибка.
+        setProgress(0);
+        setStatusKind("info");
+        setStatus("Конвертация отменена. Файл не изменён.");
       } else {
         setStatusKind("error");
         setStatus(`Ошибка: ${final.error || "конвертация не удалась"}`);
@@ -217,6 +226,22 @@ export default function ScanConverter() {
     } finally {
       setBusy(false);
       setTrouble(null);
+      setActiveJob(null);
+    }
+  }
+
+  // Отмена идущей задачи (п.4.6). Итог придёт обычным опросом статуса,
+  // поэтому здесь только просим и сообщаем, что просьба принята.
+  async function cancel() {
+    if (!activeJob) return;
+    try {
+      const state = await cancelJob(activeJob);
+      setStatus(state === "cancelled"
+        ? "Задача снята из очереди."
+        : "Отменяем: конвертация остановится на ближайшей странице…");
+    } catch (e) {
+      setStatusKind("error");
+      setStatus(`Отменить не удалось: ${(e as Error).message}`);
     }
   }
 
@@ -442,6 +467,16 @@ export default function ScanConverter() {
                 color={statusKind === "success" ? "success" : "primary"}
                 sx={{ height: 10, borderRadius: 5 }}
               />
+              {/* Отмена (п.4.6): скан останавливается на ближайшей проверке,
+                  задача из очереди снимается сразу. Нативный режим прервать
+                  нельзя — сервер ответит отказом с объяснением. */}
+              {busy && activeJob && (
+                <Box sx={{ display: "flex", justifyContent: "flex-end", mt: 1 }}>
+                  <Button size="small" color="inherit" onClick={cancel}>
+                    Отменить
+                  </Button>
+                </Box>
+              )}
             </Box>
           )}
 

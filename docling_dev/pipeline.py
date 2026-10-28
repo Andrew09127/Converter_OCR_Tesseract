@@ -220,6 +220,14 @@ def build_converter(
     except Exception as _exc:
         log.debug("progress недоступен: %s", _exc)
 
+    # Прерывание задачи (отмена, истёкший срок) — пункт 4.6. Ставится ПОСЛЕДНИМ
+    # из патчей стадий: обёртка с проверкой должна быть снаружи остальных.
+    try:
+        from .abort import install_abort_checks
+        install_abort_checks()
+    except Exception as _exc:
+        log.debug("abort недоступен: %s", _exc)
+
     ocr_opts = _tesseract_options(langs)
 
     pipeline_opts = PdfPipelineOptions()

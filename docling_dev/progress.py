@@ -24,6 +24,8 @@ from __future__ import annotations
 import logging
 import threading
 
+from .errors import JobAborted
+
 log = logging.getLogger(__name__)
 
 _LOCK = threading.Lock()
@@ -61,6 +63,12 @@ def page_done(n: int = 1) -> None:
     # и держать два замка в разном порядке — прямой путь к взаимной блокировке.
     try:
         cb(done, total)
+    except JobAborted:
+        # Пункт 4.6: это не сбой подписчика, а просьба прекратить работу —
+        # отмена или истёкший срок. Границы страницы — единственное место
+        # внутри прогона, которое принадлежит нам, поэтому проверка стоит
+        # здесь, а исключение обязано пройти наружу, а не быть съеденным.
+        raise
     except Exception as exc:                        # noqa: BLE001
         log.debug("progress: подписчик упал (%s)", exc)
 
