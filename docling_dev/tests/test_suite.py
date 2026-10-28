@@ -4,6 +4,7 @@ test_suite.py — полный набор unit-тестов для пакета 
 """
 from __future__ import annotations
 import re
+import json
 import sys
 import types
 from pathlib import Path
@@ -3480,3 +3481,150 @@ def test_smoke_env_reuses_the_same_checks():
     from docling_dev import health
     assert smoke_env.check_environment is health.check_environment
     assert smoke_env.REQUIRED_LANGS == health.REQUIRED_LANGS
+
+
+#  ЗАДАЧИ ПЕРЕЖИВАЮТ ПЕРЕЗАПУСК СЕРВЕРА (п.4.5)
+
+
+@pytest.fixture
+def jobs_disk(monkeypatch, tmp_path):
+    """Клиент к роутеру с пустой рабочей папкой задач и пустой памятью.
+
+    Имитирует перезапуск: на диске что-то лежит, в `_JOBS` — ничего.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from docling_dev import api as dev_api
+
+    monkeypatch.setattr(dev_api, "_WORK_DIR", tmp_path)
+    monkeypatch.setattr(dev_api, "_RESTORED", False)
+    saved = dict(dev_api._JOBS)
+    dev_api._JOBS.clear()
+
+    def put(job_id: str, job: dict, docx: bool = True) -> pathlib.Path:
+        d = tmp_path / job_id
+        d.mkdir(parents=True, exist_ok=True)
+        if docx:
+            path = d / job["filename"]
+            path.write_bytes(b"PK\x03\x04 not a real docx")
+            job = {**job, "docx_path": str(path)}
+        (d / "job.json").write_text(json.dumps(job, ensure_ascii=False),
+                                    encoding="utf-8")
+        return d
+
+    app = FastAPI()
+    app.include_router(dev_api.router)
+    yield TestClient(app), dev_api, put, tmp_path
+    dev_api._JOBS.clear()
+    dev_api._JOBS.update(saved)
+
+
+DONE_JOB = {"status": "done", "stage": "Готово", "progress": 1.0, "mode": "scan",
+            "filename": "готово.docx", "docx_path": "", "error": None,
+            "warning": None}
+
+
+def test_finished_job_survives_restart(jobs_disk):
+    """ГЛАВНОЕ в п.4.5: раньше после перезапуска статус давал 404, хотя DOCX
+    лежал на диске — результат часовой работы терялся на ровном месте."""
+    client, _api, put, _tmp = jobs_disk
+    put("задача-1", DONE_JOB)
+    r = client.get("/convert/status/задача-1")
+    assert r.status_code == 200
+    assert r.json()["status"] == "done"
+    assert r.json()["filename"] == "готово.docx"
+    assert client.get("/convert/download/задача-1").status_code == 200
+
+
+@pytest.mark.parametrize("status", ["queued", "running"])
+def test_unfinished_job_becomes_interrupted(jobs_disk, status):
+    """Очередь живёт в памяти процесса: продолжить такую задачу никто не
+    станет, и интерфейс ждал бы вечно."""
+    client, _api, put, _tmp = jobs_disk
+    put("задача-2", {**DONE_JOB, "status": status, "stage": "Страница 2 из 7",
+                     "progress": 0.5})
+    st = client.get("/convert/status/задача-2").json()
+    assert st["status"] == "error"
+    assert st["error_code"] == "INTERRUPTED"
+    assert "перезапущ" in st["error"]
+    assert st["error_hint"]
+
+
+def test_interrupted_state_is_written_back(jobs_disk):
+    """Пометка должна лечь на диск: иначе следующий запуск снова покажет
+    «выполняется» по задаче, которую никто не делает."""
+    client, _api, put, tmp = jobs_disk
+    d = put("задача-3", {**DONE_JOB, "status": "running"})
+    client.get("/convert/status/задача-3")
+    on_disk = json.loads((d / "job.json").read_text(encoding="utf-8"))
+    assert on_disk["status"] == "error"
+    assert on_disk["error_code"] == "INTERRUPTED"
+
+
+def test_restore_ignores_dirs_without_job_file(jobs_disk):
+    """В рабочей папке лежат ещё и временные папки анализа — это не задачи."""
+    client, dev_api, _put, tmp = jobs_disk
+    (tmp / "analyze_хлам").mkdir()
+    (tmp / "analyze_хлам" / "файл.pdf").write_bytes(b"%PDF-1.4")
+    assert client.get("/convert/status/analyze_хлам").status_code == 404
+    assert dev_api._JOBS == {}
+
+
+def test_restore_survives_broken_json(jobs_disk):
+    """Выключение в момент записи не должно мешать поднять ОСТАЛЬНЫЕ задачи."""
+    client, _api, put, tmp = jobs_disk
+    d = tmp / "битая"
+    d.mkdir()
+    (d / "job.json").write_text("{обрезан", encoding="utf-8")
+    put("задача-4", DONE_JOB)
+    assert client.get("/convert/status/битая").status_code == 404
+    assert client.get("/convert/status/задача-4").status_code == 200
+
+
+def test_memory_wins_over_disk(jobs_disk):
+    """Задача текущего запуска свежее файла: затирать её диском нельзя."""
+    client, dev_api, put, _tmp = jobs_disk
+    put("задача-5", {**DONE_JOB, "stage": "Готово"})
+    with dev_api._JOBS_LOCK:
+        dev_api._JOBS["задача-5"] = {**DONE_JOB, "status": "running",
+                                     "stage": "Страница 1 из 3"}
+    st = client.get("/convert/status/задача-5").json()
+    assert st["status"] == "running"
+    assert st["stage"] == "Страница 1 из 3"
+
+
+def test_set_persists_every_change(jobs_disk):
+    """Прогресс и итог обязаны попадать на диск по ходу: иначе переживёт
+    перезапуск только то, что было на момент постановки в очередь."""
+    client, dev_api, put, tmp = jobs_disk
+    put("задача-6", DONE_JOB)
+    client.get("/convert/status/задача-6")        # поднимаем с диска
+    dev_api._set("задача-6", stage="Доочистка: исправлено 7", polished=True)
+    on_disk = json.loads((tmp / "задача-6" / "job.json").read_text(encoding="utf-8"))
+    assert on_disk["stage"] == "Доочистка: исправлено 7"
+    assert on_disk["polished"] is True
+
+
+def test_job_file_write_is_atomic(jobs_disk):
+    """Пишем через временный файл и os.replace: обрезанный JSON стоил бы
+    готового DOCX. Временный файл не должен оставаться."""
+    client, dev_api, put, tmp = jobs_disk
+    put("задача-7", DONE_JOB)
+    dev_api._write_job("задача-7", {**DONE_JOB, "stage": "Готово"})
+    assert list((tmp / "задача-7").glob("*.tmp")) == []
+    import inspect
+    assert "os.replace" in inspect.getsource(dev_api._write_job)
+
+
+def test_restore_runs_once(jobs_disk, monkeypatch):
+    """Сканировать папку задач на каждый запрос статуса незачем."""
+    client, dev_api, put, _tmp = jobs_disk
+    put("задача-8", DONE_JOB)
+    calls = []
+    real = dev_api._restore_jobs
+    monkeypatch.setattr(dev_api, "_restore_jobs",
+                        lambda: calls.append(1) or real())
+    client.get("/convert/status/задача-8")
+    client.get("/convert/status/задача-8")
+    client.get("/convert/status/нет-такой")
+    assert len(calls) == 1

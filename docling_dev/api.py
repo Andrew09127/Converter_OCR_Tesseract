@@ -19,7 +19,9 @@ HTTP-слой конвертера: FastAPI APIRouter.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import shutil
 import tempfile
 import threading
@@ -47,7 +49,9 @@ _JOBS_LOCK = threading.Lock()
 # Один воркер — задачи идут по очереди (сериализация прогонов).
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="convert")
 
-# Рабочая папка задач (вход PDF + выход DOCX). В системном temp, чистится при старте.
+# Рабочая папка задач (вход PDF + выход DOCX) в системном temp. НЕ чистится:
+# рядом с каждым PDF/DOCX лежит `job.json`, по которому задачи восстанавливаются
+# после перезапуска сервера (п.4.5).
 _WORK_DIR = Path(tempfile.gettempdir()) / "convert_api_jobs"
 _WORK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -67,11 +71,100 @@ _OCR_READER: list = []          # [reader] или [] ; None-маркер нед�
 _OCR_READER_LOCK = threading.Lock()
 
 
+# Задачи восстанавливаются лениво, при первом обращении к статусу или файлу.
+# Событие старта не годится: в sberAct подключают только наш роутер, своё
+# приложение они строят сами, и lifespan у нас не вызывается.
+_RESTORED = False
+_RESTORE_LOCK = threading.Lock()
+
+
+def _job_file(job_id: str) -> Path:
+    return _WORK_DIR / job_id / "job.json"
+
+
+def _write_job(job_id: str, snapshot: dict) -> None:
+    """Сохранить снимок задачи рядом с её файлами (п.4.5).
+
+    Пишем через временный файл и `os.replace`: иначе выключение в момент записи
+    оставит обрезанный JSON, и задача пропадёт вместе с готовым DOCX. Ошибки
+    записи не роняют конвертацию — она важнее возможности узнать статус потом.
+    """
+    path = _job_file(job_id)
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.debug("api: не удалось сохранить задачу %s: %s", job_id, exc)
+
+
 def _set(job_id: str, **changes) -> None:
-    """Атомарно обновить запись задачи."""
+    """Атомарно обновить запись задачи и сохранить её на диск."""
     with _JOBS_LOCK:
-        if job_id in _JOBS:
-            _JOBS[job_id].update(changes)
+        job = _JOBS.get(job_id)
+        if job is None:
+            return
+        job.update(changes)
+        snapshot = dict(job)
+    # Файл пишем ВНЕ замка: `_JOBS_LOCK` не реентрантный, да и держать его на
+    # время записи незачем.
+    _write_job(job_id, snapshot)
+
+
+def _restore_jobs() -> int:
+    """Поднять задачи прошлых запусков из `job.json`. Возвращает их число.
+
+    `queued` и `running` продолжить нельзя: очередь живёт в памяти процесса, и
+    после перезапуска никто эту работу не делает. Такие задачи помечаются
+    ошибкой с кодом `INTERRUPTED` — иначе интерфейс ждал бы вечно.
+    """
+    from .errors import ConvertError
+    restored = 0
+    for job_dir in sorted(_WORK_DIR.iterdir()):
+        if not job_dir.is_dir():
+            continue
+        path = job_dir / "job.json"
+        if not path.is_file():
+            continue                      # папка анализа или мусор — не задача
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log.warning("api: задача %s не читается: %s", job_dir.name, exc)
+            continue
+        if not isinstance(job, dict) or "status" not in job:
+            continue
+        job_id = job_dir.name
+        if job["status"] in ("queued", "running"):
+            err = ConvertError("INTERRUPTED",
+                               f"статус на момент перезапуска: {job['status']}")
+            job.update(status="error", stage="Прервано перезапуском",
+                       error=err.text(), error_code=err.code,
+                       error_hint=err.hint, error_detail=err.detail)
+        with _JOBS_LOCK:
+            if job_id in _JOBS:
+                continue                  # задача этого запуска — она свежее
+            _JOBS[job_id] = job
+        restored += 1
+        if job["stage"] == "Прервано перезапуском":
+            _write_job(job_id, job)
+    return restored
+
+
+def _ensure_restored() -> None:
+    """Один раз на процесс поднять задачи с диска (п.4.5)."""
+    global _RESTORED
+    if _RESTORED:
+        return
+    with _RESTORE_LOCK:
+        if _RESTORED:
+            return
+        try:
+            count = _restore_jobs()
+            if count:
+                log.info("api: восстановлено задач с диска: %d", count)
+        except Exception as exc:                 # noqa: BLE001
+            log.warning("api: не удалось восстановить задачи: %s", exc)
+        _RESTORED = True
 
 
 def _fail(job_id: str, err) -> None:
@@ -430,11 +523,12 @@ async def convert_scan(
         "ink_bold": ink_bold,
         "ocr_preprocess": ocr_preprocess,
     }
+    job = {"status": "queued", "stage": "В очереди…", "progress": 0.0,
+           "mode": "scan", "filename": docx_path.name,
+           "docx_path": str(docx_path), "error": None, "warning": warning}
     with _JOBS_LOCK:
-        _JOBS[job_id] = {"status": "queued", "stage": "В очереди…", "progress": 0.0,
-                         "mode": "scan", "filename": docx_path.name,
-                         "docx_path": str(docx_path), "error": None,
-                         "warning": warning}
+        _JOBS[job_id] = job
+    _write_job(job_id, dict(job))
     _EXECUTOR.submit(_run_scan, job_id, pdf_path, docx_path, flags)
     return {"job_id": job_id, "warning": warning}
 
@@ -443,17 +537,24 @@ async def convert_scan(
 async def convert_native(file: UploadFile = File(...)):
     """Нативный PDF (pdf2docx, без флагов). Возвращает job_id для опроса статуса."""
     job_id, pdf_path, docx_path = _accept_upload(file)
+    job = {"status": "queued", "stage": "В очереди…", "progress": 0.0,
+           "mode": "native", "filename": docx_path.name,
+           "docx_path": str(docx_path), "error": None}
     with _JOBS_LOCK:
-        _JOBS[job_id] = {"status": "queued", "stage": "В очереди…", "progress": 0.0,
-                         "mode": "native", "filename": docx_path.name,
-                         "docx_path": str(docx_path), "error": None}
+        _JOBS[job_id] = job
+    _write_job(job_id, dict(job))
     _EXECUTOR.submit(_run_native, job_id, pdf_path, docx_path)
     return {"job_id": job_id}
 
 
 @router.get("/status/{job_id}")
 async def convert_status(job_id: str):
-    """Текущий статус задачи: queued | running | done | error (+ стадия и прогресс)."""
+    """Текущий статус задачи: queued | running | done | error (+ стадия и прогресс).
+
+    Задача могла быть создана до перезапуска сервера — тогда она поднимается с
+    диска (п.4.5): готовый DOCX лежит на месте, и терять его из-за 404 нельзя.
+    """
+    _ensure_restored()
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
         if job is None:
@@ -516,6 +617,7 @@ async def convert_polish(job_id: str):
     Идёт в ту же однопоточную очередь, что и конвертации. Прогресс и результат —
     через обычный `GET /convert/status/{job_id}`.
     """
+    _ensure_restored()
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
         if job is None:
@@ -543,6 +645,7 @@ async def convert_polish(job_id: str):
 @router.get("/download/{job_id}")
 async def convert_download(job_id: str):
     """Отдаёт готовый DOCX. Доступно только после status == done."""
+    _ensure_restored()
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
     if job is None:
