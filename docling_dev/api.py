@@ -49,6 +49,12 @@ _JOBS_LOCK = threading.Lock()
 # Один воркер — задачи идут по очереди (сериализация прогонов).
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="convert")
 
+# job_key → job_id. Ключ идемпотентности: сетевой сбой на POST не говорит
+# клиенту, дошёл ли запрос, и честный повтор без ключа создал бы ВТОРУЮ задачу
+# на тот же файл — двойное время и двойная память. С ключом повтор возвращает
+# ту же задачу. Восстанавливается с диска вместе с задачами (п.4.5).
+_JOB_KEYS: dict = {}
+
 # job_id → Future. Нужен для отмены (п.4.6): задачу, которая ещё не начиналась,
 # снимает сам исполнитель, и это единственный надёжный способ её не делать.
 _FUTURES: dict = {}
@@ -77,9 +83,13 @@ def _job_timeout_s() -> float:
 _WORK_DIR = Path(tempfile.gettempdir()) / "convert_api_jobs"
 _WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-# Кэш Docling-конвертера: построение тяжёлое, поэтому держим
-# по одному экземпляру на значение ocr_preprocess (оно меняет pipeline).
-_SCAN_CONVERTERS: dict[bool, object] = {}
+# Кэш Docling-конвертера: построение тяжёлое (1.8 s и ~230 МБ), поэтому
+# держим готовый экземпляр. Слот РОВНО ОДИН: и флаг ocr_preprocess, и
+# ресурсный профиль меняют pipeline, но кэшировать их комбинации нельзя —
+# каждый экземпляр держит свой набор моделей, то есть вторая запись в кэше
+# это +230 МБ впустую. Конвертации сериализованы одним воркером, так что
+# пересборка при смене настроек стоит 1.8 s один раз.
+_SCAN_CACHE: dict = {"key": None, "conv": None}
 _SCAN_LOCK = threading.Lock()
 
 # Кэш ответа /convert/health: проверка дешёвая (~0.1 s), но health-цикл
@@ -133,6 +143,24 @@ def _set(job_id: str, **changes) -> None:
     _write_job(job_id, snapshot)
 
 
+def _reuse_by_key(job_key: str | None) -> dict | None:
+    """Задача, уже созданная по этому ключу, если её ещё имеет смысл отдавать.
+
+    Сорвавшуюся задачу НЕ переиспользуем: повтор после ошибки — это осознанная
+    вторая попытка, а не дубликат запроса.
+    """
+    if not job_key:
+        return None
+    _ensure_restored()
+    with _JOBS_LOCK:
+        job_id = _JOB_KEYS.get(job_key)
+        job = _JOBS.get(job_id) if job_id else None
+        if job is None or job["status"] == "error":
+            return None
+        log.info("api: повтор по ключу %s — отдаю задачу %s", job_key, job_id)
+        return {"job_id": job_id, "warning": job.get("warning"), "reused": True}
+
+
 def _restore_jobs() -> int:
     """Поднять задачи прошлых запусков из `job.json`. Возвращает их число.
 
@@ -166,6 +194,8 @@ def _restore_jobs() -> int:
             if job_id in _JOBS:
                 continue                  # задача этого запуска — она свежее
             _JOBS[job_id] = job
+            if job.get("job_key"):
+                _JOB_KEYS.setdefault(job["job_key"], job_id)
         restored += 1
         if job["stage"] == "Прервано перезапуском":
             _write_job(job_id, job)
@@ -219,16 +249,23 @@ def _busy() -> bool:
         return any(j.get("status") in ("queued", "running") for j in _JOBS.values())
 
 
-def _get_scan_converter(ocr_preprocess: bool):
-    """Лениво строит и кэширует Docling-конвертер под флаг предобработки."""
+def _get_scan_converter(ocr_preprocess: bool, profile: str | None = None):
+    """Лениво строит и кэширует Docling-конвертер под флаг предобработки и
+    ресурсный профиль. При смене любого из них пересобирает (см. `_SCAN_CACHE`)."""
+    from .profiles import resolve
+    key = (bool(ocr_preprocess), resolve(profile).name)
     with _SCAN_LOCK:
-        conv = _SCAN_CONVERTERS.get(ocr_preprocess)
-        if conv is None:
+        if _SCAN_CACHE["key"] != key or _SCAN_CACHE["conv"] is None:
             from . import build_converter
-            log.info("api: строю Docling-конвертер (ocr_preprocess=%s)", ocr_preprocess)
-            conv = build_converter(ocr_preprocess=ocr_preprocess)
-            _SCAN_CONVERTERS[ocr_preprocess] = conv
-    return conv
+            log.info("api: строю Docling-конвертер (ocr_preprocess=%s, профиль %s)",
+                     key[0], key[1])
+            _SCAN_CACHE["conv"] = None      # старый отпускаем ДО построения нового
+            import gc
+            gc.collect()
+            _SCAN_CACHE.update(key=key,
+                               conv=build_converter(ocr_preprocess=key[0],
+                                                    profile=key[1]))
+        return _SCAN_CACHE["conv"]
 
 
 def _get_ocr_reader():
@@ -302,7 +339,8 @@ def _run_scan_body(job_id: str, pdf_path: Path, docx_path: Path,
     aborted = None
     try:
         _set(job_id, status="running", stage="Анализ скана…", progress=0.1)
-        converter = _get_scan_converter(flags["ocr_preprocess"])
+        converter = _get_scan_converter(flags["ocr_preprocess"],
+                                        flags.get("profile"))
 
         # OCR-reader нужен только для word_order — иначе не создаём.
         ocr_reader = _get_ocr_reader() if flags["word_order"] else None
@@ -430,6 +468,7 @@ async def convert_profile():
     Профиль выбирается по ядрам и памяти; переключается переменной
     CONVERTER_PROFILE (lean | balanced | full | auto).
     """
+    from . import settings
     from .profiles import machine, resolve
     prof = resolve()
     m = machine()
@@ -438,11 +477,87 @@ async def convert_profile():
         "note": prof.note,
         "ocr_workers": prof.ocr_workers,
         "num_threads": prof.num_threads,
-        "llm_default": prof.llm_default,
+        # Выбор пользователя старше профиля машины (диалог настроек).
+        "llm_default": settings.llm_default(prof.llm_default),
+        "source": settings.profile_source(),
         "cores": m["cores"],
         "ram_gb": round(m["ram_gb"], 1),
         "free_gb": round(m["free_gb"], 1),
     }
+
+
+def _settings_view() -> dict:
+    """Что показать в диалоге настроек: определённое по машине, выбранное
+    пользователем и то, что реально применится."""
+    from . import settings
+    from .profiles import PROFILES, detect, machine, resolve
+    auto = detect()
+    eff = resolve()
+    saved = settings.load()
+    m = machine()
+    return {
+        "auto": {"profile": auto.name, "note": auto.note},
+        "override": {"profile": saved.get("profile"),
+                     "llm_default": saved.get("llm_default")},
+        "effective": {"profile": eff.name, "note": eff.note,
+                      "ocr_workers": eff.ocr_workers,
+                      "num_threads": eff.num_threads,
+                      "images_scale": eff.images_scale,
+                      "llm_default": settings.llm_default(eff.llm_default)},
+        "machine": {"cores": m["cores"], "ram_gb": round(m["ram_gb"], 1),
+                    "free_gb": round(m["free_gb"], 1)},
+        "choices": ["auto", *PROFILES],
+        "source": settings.profile_source(),
+        # Окружением гоняются замеры, и сохранённый выбор его не перебивает:
+        # интерфейс должен не молча игнорировать выбор, а объяснить причину.
+        "locked_by_env": settings.env_profile() is not None,
+        "path": str(settings.path()),
+    }
+
+
+@router.get("/settings")
+async def convert_settings_get():
+    """Настройки, которые можно менять из интерфейса: профиль и дефолт LLM.
+
+    Отдаёт сразу три вещи — что определило железо (`auto`), что выбрал
+    пользователь (`override`) и что реально применится (`effective`), — чтобы
+    диалогу настроек не приходилось повторять нашу логику старшинства.
+    """
+    return _settings_view()
+
+
+@router.post("/settings")
+async def convert_settings_post(
+    profile: str | None = Form(None),
+    llm_default: bool | None = Form(None),
+    clear_llm_default: bool = Form(False),
+):
+    """Сохранить выбор пользователя. POST, а не PUT: прокси приложения
+    пропускает только GET и POST.
+
+    `profile` = auto | lean | balanced | full («auto» — решает машина);
+    `llm_default` — предлагать ли доочистку; `clear_llm_default=true`
+    возвращает значение «как решит профиль».
+    """
+    from . import settings
+    from .errors import ConvertError
+    changes: dict = {}
+    if profile is not None:
+        name = profile.strip().lower()
+        if name not in settings.PROFILE_CHOICES:
+            raise _http_error(ConvertError(
+                "INVALID_SETTINGS",
+                f"профиль {profile!r}; допустимы: "
+                f"{', '.join(settings.PROFILE_CHOICES)}"))
+        changes["profile"] = None if name == "auto" else name
+    if clear_llm_default:
+        changes["llm_default"] = None
+    elif llm_default is not None:
+        changes["llm_default"] = bool(llm_default)
+    if changes:
+        settings.save(**changes)
+        log.info("api: настройки изменены: %s", changes)
+    return _settings_view()
 
 
 @router.get("/health")
@@ -551,8 +666,30 @@ async def convert_scan(
     iim: bool = Form(True),
     ink_bold: bool = Form(False),
     ocr_preprocess: bool = Form(False),
+    profile: str | None = Form(None),
+    job_key: str | None = Form(None),
 ):
-    """Скан-режим (Docling + RapidOCR + LLM). Возвращает job_id для опроса статуса."""
+    """Скан-режим (Docling + Tesseract + LLM). Возвращает job_id для опроса статуса.
+
+    `profile` (auto|lean|balanced|full) — разовое переопределение ресурсного
+    профиля; без него действует настройка пользователя или выбор по машине.
+    `job_key` — ключ идемпотентности: повтор запроса с тем же ключом вернёт ту
+    же задачу вместо создания второй (нужен фронту, чтобы безопасно ретраить
+    POST после сетевого сбоя).
+    """
+    from . import settings
+    from .errors import ConvertError
+    if profile is not None:
+        name = profile.strip().lower()
+        if name not in settings.PROFILE_CHOICES:
+            raise _http_error(ConvertError(
+                "INVALID_SETTINGS",
+                f"профиль {profile!r}; допустимы: "
+                f"{', '.join(settings.PROFILE_CHOICES)}"))
+        profile = name
+    reused = _reuse_by_key(job_key)
+    if reused is not None:
+        return reused
     job_id, pdf_path, docx_path = _accept_upload(file)
     # Проверка текстового слоя стоит доли секунды (чтение PyMuPDF) и делается
     # до постановки в очередь, чтобы предупреждение было видно сразу.
@@ -579,30 +716,43 @@ async def convert_scan(
         "llm": iim,                      # «iim» в интерфейсе = LLM-доочистка
         "ink_bold": ink_bold,
         "ocr_preprocess": ocr_preprocess,
+        "profile": profile,
     }
     job = {"status": "queued", "stage": "В очереди…", "progress": 0.0,
            "mode": "scan", "filename": docx_path.name,
-           "docx_path": str(docx_path), "error": None, "warning": warning}
+           "docx_path": str(docx_path), "error": None, "warning": warning,
+           "job_key": job_key}
     with _JOBS_LOCK:
         _JOBS[job_id] = job
+        if job_key:
+            _JOB_KEYS[job_key] = job_id
     _write_job(job_id, dict(job))
     _FUTURES[job_id] = _EXECUTOR.submit(_run_scan, job_id, pdf_path,
                                         docx_path, flags)
-    return {"job_id": job_id, "warning": warning}
+    return {"job_id": job_id, "warning": warning, "reused": False}
 
 
 @router.post("/native")
-async def convert_native(file: UploadFile = File(...)):
-    """Нативный PDF (pdf2docx, без флагов). Возвращает job_id для опроса статуса."""
+async def convert_native(file: UploadFile = File(...),
+                         job_key: str | None = Form(None)):
+    """Нативный PDF (pdf2docx, без флагов). Возвращает job_id для опроса статуса.
+
+    `job_key` — тот же ключ идемпотентности, что и у скана.
+    """
+    reused = _reuse_by_key(job_key)
+    if reused is not None:
+        return reused
     job_id, pdf_path, docx_path = _accept_upload(file)
     job = {"status": "queued", "stage": "В очереди…", "progress": 0.0,
            "mode": "native", "filename": docx_path.name,
-           "docx_path": str(docx_path), "error": None}
+           "docx_path": str(docx_path), "error": None, "job_key": job_key}
     with _JOBS_LOCK:
         _JOBS[job_id] = job
+        if job_key:
+            _JOB_KEYS[job_key] = job_id
     _write_job(job_id, dict(job))
     _FUTURES[job_id] = _EXECUTOR.submit(_run_native, job_id, pdf_path, docx_path)
-    return {"job_id": job_id}
+    return {"job_id": job_id, "reused": False}
 
 
 @router.post("/cancel/{job_id}")

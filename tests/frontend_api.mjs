@@ -129,6 +129,38 @@ try {
         e.message.includes("перезапустите программу"), e.message);
 }
 
+// ── настройки и ключ идемпотентности ────────────────────────────────────────
+mock(() => json(200, {
+  auto: { profile: "full", note: "" },
+  override: { profile: "lean", llm_default: false },
+  effective: { profile: "lean", note: "", ocr_workers: 1, num_threads: 2,
+               images_scale: 1, llm_default: false },
+  machine: { cores: 8, ram_gb: 31, free_gb: 17 },
+  choices: ["auto", "lean", "balanced", "full"],
+  source: "user", locked_by_env: false, path: "settings.json",
+}));
+const st = await api.getSettings();
+check("настройки читаются", st.effective.profile === "lean" && st.source === "user");
+
+let sentProfile = null;
+mock(async (url, init) => {
+  sentProfile = init.body.get("profile");
+  return json(200, { ...st, override: { profile: "auto", llm_default: null } });
+});
+await api.saveSettings({ profile: "auto" });
+check("профиль уходит на сервер", sentProfile === "auto", String(sentProfile));
+
+let keys = [];
+mock(async (url, init) => {
+  keys.push(init.body.get("job_key"));
+  return json(200, { job_id: "j1" });
+});
+await api.startConversion("scan", new File([], "a.pdf"), undefined);
+await api.startConversion("scan", new File([], "a.pdf"), undefined);
+check("каждый запуск несёт свой job_key",
+      keys.length === 2 && keys[0] && keys[1] && keys[0] !== keys[1],
+      JSON.stringify(keys));
+
 // ── отмена задачи (п.4.6) ───────────────────────────────────────────────────
 mock(() => json(200, { job_id: "x", state: "cancelling" }));
 check("отмена идущей задачи", (await api.cancelJob("x")) === "cancelling");

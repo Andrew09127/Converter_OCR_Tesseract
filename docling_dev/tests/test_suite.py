@@ -3242,17 +3242,34 @@ def test_convert_pdf_checked_raises_with_code(pdfs, tmp_path):
 
 
 @pytest.fixture
-def errors_client(monkeypatch):
-    """Клиент к роутеру с подменённой конвертацией: проверяем HTTP-слой."""
+def errors_client(monkeypatch, tmp_path):
+    """Клиент к роутеру с подменённой конвертацией: проверяем HTTP-слой.
+
+    Рабочая папка задач — своя: иначе тесты пишут задачи в настоящую
+    `%TEMP%/convert_api_jobs`, а следующий прогон поднимает их с диска (п.4.5) и
+    проверка идемпотентности видит «повтор» на первом же запросе.
+    """
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from docling_dev import api as dev_api
 
-    monkeypatch.setattr(dev_api, "_get_scan_converter", lambda flag: object())
+    work = tmp_path / "jobs"
+    work.mkdir()
+    monkeypatch.setattr(dev_api, "_WORK_DIR", work)
+    monkeypatch.setattr(dev_api, "_RESTORED", False)
+    monkeypatch.setattr(dev_api, "_get_scan_converter",
+                        lambda flag, profile=None: object())
     monkeypatch.setattr(dev_api._EXECUTOR, "submit", lambda fn, *a: fn(*a))
+    saved_jobs, saved_keys = dict(dev_api._JOBS), dict(dev_api._JOB_KEYS)
+    dev_api._JOBS.clear()
+    dev_api._JOB_KEYS.clear()
     app = FastAPI()
     app.include_router(dev_api.router)
     yield TestClient(app), dev_api
+    dev_api._JOBS.clear()
+    dev_api._JOBS.update(saved_jobs)
+    dev_api._JOB_KEYS.clear()
+    dev_api._JOB_KEYS.update(saved_keys)
 
 
 def test_scan_rejects_encrypted_pdf_before_queue(errors_client, pdfs):
@@ -3500,7 +3517,9 @@ def jobs_disk(monkeypatch, tmp_path):
     monkeypatch.setattr(dev_api, "_WORK_DIR", tmp_path)
     monkeypatch.setattr(dev_api, "_RESTORED", False)
     saved = dict(dev_api._JOBS)
+    saved_keys = dict(dev_api._JOB_KEYS)
     dev_api._JOBS.clear()
+    dev_api._JOB_KEYS.clear()
 
     def put(job_id: str, job: dict, docx: bool = True) -> pathlib.Path:
         d = tmp_path / job_id
@@ -3518,6 +3537,8 @@ def jobs_disk(monkeypatch, tmp_path):
     yield TestClient(app), dev_api, put, tmp_path
     dev_api._JOBS.clear()
     dev_api._JOBS.update(saved)
+    dev_api._JOB_KEYS.clear()
+    dev_api._JOB_KEYS.update(saved_keys)
 
 
 DONE_JOB = {"status": "done", "stage": "Готово", "progress": 1.0, "mode": "scan",
@@ -3992,3 +4013,244 @@ def test_log_endpoint_404_without_log(jobs_disk):
 def test_log_endpoint_404_for_unknown_job(jobs_disk):
     client, *_ = jobs_disk
     assert client.get("/convert/log/нет-такой").status_code == 404
+
+
+#  НАСТРОЙКИ ИЗ ИНТЕРФЕЙСА, ПРОФИЛЬ НА ЗАПРОС, ИДЕМПОТЕНТНОСТЬ POST
+
+
+@pytest.fixture
+def user_settings(monkeypatch, tmp_path):
+    """Изолированный файл настроек: кэш модульный, обязательно сбрасывать."""
+    from docling_dev import settings
+    monkeypatch.setenv("CONVERTER_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.delenv("CONVERTER_PROFILE", raising=False)
+    settings.reset_cache()
+    yield settings
+    settings.reset_cache()
+
+
+def test_settings_save_and_load(user_settings):
+    assert user_settings.load() == {}
+    user_settings.save(profile="lean", llm_default=False)
+    user_settings.reset_cache()
+    assert user_settings.load() == {"profile": "lean", "llm_default": False}
+    assert user_settings.path().is_file()
+
+
+def test_settings_none_removes_key(user_settings):
+    """Так интерфейс возвращает значение «как решит программа»."""
+    user_settings.save(profile="lean")
+    user_settings.save(profile=None)
+    assert "profile" not in user_settings.load()
+
+
+def test_settings_broken_file_is_not_fatal(user_settings):
+    """Настройка не критична: оборванный файл не должен ронять конвертацию."""
+    user_settings.path().parent.mkdir(parents=True, exist_ok=True)
+    user_settings.path().write_text("{обрезан", encoding="utf-8")
+    user_settings.reset_cache()
+    assert user_settings.load() == {}
+
+
+def test_settings_env_beats_saved_choice(user_settings, monkeypatch):
+    """Окружением гоняются замеры и A/B — сохранённый файл его не перебивает,
+    иначе снимки скорости начнут врать."""
+    user_settings.save(profile="lean")
+    assert user_settings.profile_name() == "lean"
+    assert user_settings.profile_source() == "user"
+    monkeypatch.setenv("CONVERTER_PROFILE", "full")
+    assert user_settings.profile_name() == "full"
+    assert user_settings.profile_source() == "env"
+    assert user_settings.env_profile() == "full"
+
+
+def test_settings_llm_default_override(user_settings):
+    assert user_settings.llm_default(True) is True       # нет выбора — как профиль
+    user_settings.save(llm_default=False)
+    assert user_settings.llm_default(True) is False
+    user_settings.save(llm_default=None)
+    assert user_settings.llm_default(True) is True
+
+
+def test_resolve_uses_saved_profile(user_settings):
+    """Главное звено: сохранённый выбор должен доезжать до самой конвертации."""
+    from docling_dev import profiles
+    user_settings.save(profile="lean")
+    assert profiles.resolve().name == "lean"
+    assert profiles.resolve("full").name == "full"       # аргумент старше
+
+
+@pytest.fixture
+def settings_client(user_settings):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from docling_dev import api as dev_api
+    app = FastAPI()
+    app.include_router(dev_api.router)
+    return TestClient(app), dev_api, user_settings
+
+
+def test_settings_endpoint_shows_auto_override_effective(settings_client):
+    """Диалогу настроек не должно приходиться повторять нашу логику
+    старшинства — поэтому отдаём сразу все три значения."""
+    client, _api, _s = settings_client
+    body = client.get("/convert/settings").json()
+    assert body["auto"]["profile"] in ("lean", "balanced", "full")
+    assert body["override"] == {"profile": None, "llm_default": None}
+    assert body["effective"]["profile"] == body["auto"]["profile"]
+    assert body["choices"] == ["auto", "lean", "balanced", "full"]
+    assert body["source"] == "auto"
+    assert body["locked_by_env"] is False
+    assert body["path"].endswith("settings.json")
+    assert "cores" in body["machine"]
+
+
+def test_settings_endpoint_saves_profile(settings_client):
+    client, _api, s = settings_client
+    body = client.post("/convert/settings", data={"profile": "lean"}).json()
+    assert body["override"]["profile"] == "lean"
+    assert body["effective"]["profile"] == "lean"
+    assert body["effective"]["ocr_workers"] == 1
+    assert body["source"] == "user"
+    s.reset_cache()
+    assert s.load()["profile"] == "lean"             # и на диске
+
+
+def test_settings_endpoint_auto_clears_choice(settings_client):
+    client, *_ = settings_client
+    client.post("/convert/settings", data={"profile": "full"})
+    body = client.post("/convert/settings", data={"profile": "auto"}).json()
+    assert body["override"]["profile"] is None
+    assert body["source"] == "auto"
+
+
+def test_settings_endpoint_rejects_unknown_profile(settings_client):
+    client, *_ = settings_client
+    r = client.post("/convert/settings", data={"profile": "турбо"})
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "INVALID_SETTINGS"
+    assert "lean" in r.json()["detail"]["hint"]
+
+
+def test_settings_endpoint_llm_default(settings_client):
+    client, *_ = settings_client
+    body = client.post("/convert/settings", data={"llm_default": "true"}).json()
+    assert body["override"]["llm_default"] is True
+    assert body["effective"]["llm_default"] is True
+    body = client.post("/convert/settings",
+                       data={"clear_llm_default": "true"}).json()
+    assert body["override"]["llm_default"] is None
+
+
+def test_settings_endpoint_reports_env_lock(settings_client, monkeypatch):
+    """Если профиль задан окружением, интерфейс должен ОБЪЯСНИТЬ, почему выбор
+    пользователя не применился, а не молча его игнорировать."""
+    client, _api, s = settings_client
+    s.save(profile="lean")
+    monkeypatch.setenv("CONVERTER_PROFILE", "full")
+    body = client.get("/convert/settings").json()
+    assert body["locked_by_env"] is True
+    assert body["source"] == "env"
+    assert body["override"]["profile"] == "lean"     # выбор виден
+    assert body["effective"]["profile"] == "full"    # но действует окружение
+
+
+def test_profile_endpoint_follows_saved_llm_default(settings_client):
+    """По этому полю интерфейс ставит галочку «iim» — она обязана слушаться
+    пользователя, а не только машину."""
+    client, _api, s = settings_client
+    s.save(llm_default=False)
+    assert client.get("/convert/profile").json()["llm_default"] is False
+    s.save(llm_default=True)
+    assert client.get("/convert/profile").json()["llm_default"] is True
+
+
+def test_converter_cache_has_one_slot(monkeypatch, user_settings):
+    """Кэшировать конвертеры по профилю нельзя: каждый держит свой набор
+    моделей, то есть вторая запись — это +230 МБ впустую."""
+    from docling_dev import api as dev_api
+    built = []
+    monkeypatch.setattr("docling_dev.build_converter",
+                        lambda **kw: built.append(kw) or object())
+    dev_api._SCAN_CACHE.update(key=None, conv=None)
+    try:
+        first = dev_api._get_scan_converter(False, "lean")
+        again = dev_api._get_scan_converter(False, "lean")
+        assert first is again                        # тот же — не пересобрали
+        assert len(built) == 1
+        other = dev_api._get_scan_converter(False, "full")
+        assert other is not first                    # профиль сменился
+        assert [b["profile"] for b in built] == ["lean", "full"]
+        assert dev_api._SCAN_CACHE["key"] == (False, "full")
+    finally:
+        dev_api._SCAN_CACHE.update(key=None, conv=None)
+
+
+def test_scan_rejects_unknown_profile(errors_client, pdfs):
+    client, _ = errors_client
+    with pdfs["ok"].open("rb") as f:
+        r = client.post("/convert/scan",
+                        files={"file": ("ok.pdf", f, "application/pdf")},
+                        data={"profile": "турбо"})
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "INVALID_SETTINGS"
+
+
+def test_job_key_makes_retry_return_the_same_job(errors_client, pdfs, monkeypatch):
+    """Сетевой сбой на POST не говорит клиенту, дошёл ли запрос. Без ключа
+    честный повтор создал бы вторую задачу на тот же файл — двойное время и
+    двойная память."""
+    client, dev_api = errors_client
+    monkeypatch.setattr("docling_dev.convert_pdf_checked",
+                        lambda *a, **kw: Path(a[1]).write_bytes(b"docx"))
+    def post():
+        with pdfs["ok"].open("rb") as f:
+            return client.post("/convert/scan",
+                               files={"file": ("ok.pdf", f, "application/pdf")},
+                               data={"job_key": "ключ-1"}).json()
+    first = post()
+    assert first["reused"] is False
+    second = post()
+    assert second["job_id"] == first["job_id"]
+    assert second["reused"] is True
+    with dev_api._JOBS_LOCK:
+        mine = [j for j in dev_api._JOBS.values() if j.get("job_key") == "ключ-1"]
+    assert len(mine) == 1
+
+
+def test_job_key_allows_retry_after_error(errors_client, pdfs, monkeypatch):
+    """Повтор ПОСЛЕ ошибки — осознанная вторая попытка, а не дубликат запроса."""
+    client, _dev_api = errors_client
+    monkeypatch.setattr("docling_dev.convert_pdf_checked",
+                        lambda *a, **kw: (_ for _ in ()).throw(MemoryError("нет")))
+    def post():
+        with pdfs["ok"].open("rb") as f:
+            return client.post("/convert/scan",
+                               files={"file": ("ok.pdf", f, "application/pdf")},
+                               data={"job_key": "ключ-2"}).json()
+    first = post()
+    second = post()
+    assert second["job_id"] != first["job_id"]
+    assert second["reused"] is False
+
+
+def test_without_job_key_every_post_is_a_new_job(errors_client, pdfs, monkeypatch):
+    client, _ = errors_client
+    monkeypatch.setattr("docling_dev.convert_pdf_checked",
+                        lambda *a, **kw: Path(a[1]).write_bytes(b"docx"))
+    ids = set()
+    for _ in range(2):
+        with pdfs["ok"].open("rb") as f:
+            ids.add(client.post("/convert/scan",
+                                files={"file": ("ok.pdf", f, "application/pdf")}
+                                ).json()["job_id"])
+    assert len(ids) == 2
+
+
+def test_job_keys_survive_restart(jobs_disk):
+    """Ключи поднимаются с диска вместе с задачами: иначе повтор после
+    перезапуска сервера создал бы дубликат."""
+    client, dev_api, put, _tmp = jobs_disk
+    put("задача-к", {**DONE_JOB, "job_key": "ключ-3"})
+    client.get("/convert/status/задача-к")            # поднимаем с диска
+    assert dev_api._JOB_KEYS.get("ключ-3") == "задача-к"

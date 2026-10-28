@@ -54,6 +54,15 @@ async function failure(res: Response, fallback: string): Promise<ConvertFailure>
   return err;
 }
 
+function newJobKey(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    // Старый webview без crypto.randomUUID: ключ нужен лишь уникальный.
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+}
+
 // Любой запрос к конвертеру: сам fetch бросает TypeError, когда сервера нет, и
 // браузер показывает «Failed to fetch». Здесь это превращается во внятный текст.
 async function send(url: string, init?: RequestInit): Promise<Response> {
@@ -122,6 +131,51 @@ export interface MachineProfile {
   free_gb: number;
 }
 
+// Настройки, которые пользователь меняет сам (профиль и дефолт доочистки).
+// Сервер отдаёт сразу три значения, чтобы интерфейсу не пришлось повторять
+// логику старшинства: определённое по машине, выбранное пользователем и то,
+// что реально применится.
+export type ProfileChoice = "auto" | "lean" | "balanced" | "full";
+
+export interface ConverterSettings {
+  auto: { profile: string; note: string };
+  override: { profile: string | null; llm_default: boolean | null };
+  effective: {
+    profile: string;
+    note: string;
+    ocr_workers: number;
+    num_threads: number;
+    images_scale: number;
+    llm_default: boolean;
+  };
+  machine: { cores: number; ram_gb: number; free_gb: number };
+  choices: string[];
+  source: "auto" | "user" | "env";
+  // Профиль задан переменной окружения: выбор пользователя не применится, и
+  // интерфейс обязан объяснить это, а не молча его игнорировать.
+  locked_by_env: boolean;
+  path: string;
+}
+
+export async function getSettings(): Promise<ConverterSettings> {
+  const res = await send("/convert/settings");
+  if (!res.ok) throw await failure(res, "Настройки недоступны");
+  return (await res.json()) as ConverterSettings;
+}
+
+export async function saveSettings(
+  changes: { profile?: ProfileChoice; llm_default?: boolean },
+): Promise<ConverterSettings> {
+  const form = new FormData();
+  if (changes.profile) form.append("profile", changes.profile);
+  if (changes.llm_default !== undefined) {
+    form.append("llm_default", String(changes.llm_default));
+  }
+  const res = await send("/convert/settings", { method: "POST", body: form });
+  if (!res.ok) throw await failure(res, "Настройку не удалось сохранить");
+  return (await res.json()) as ConverterSettings;
+}
+
 export async function getProfile(): Promise<MachineProfile> {
   const res = await send("/convert/profile");
   if (!res.ok) throw await failure(res, "Профиль недоступен");
@@ -161,6 +215,10 @@ export async function startConversion(
 ): Promise<string> {
   const form = new FormData();
   form.append("file", file);
+  // Ключ идемпотентности (п.4.6): свой на каждый запуск. Повтор ЭТОГО запроса
+  // вернёт ту же задачу вместо второй на том же файле; новое нажатие кнопки
+  // получает новый ключ и создаёт новую задачу.
+  form.append("job_key", newJobKey());
   if (mode === "scan" && flags) {
     form.append("no_highlight", String(flags.no_highlight));
     form.append("word_order", String(flags.word_order));

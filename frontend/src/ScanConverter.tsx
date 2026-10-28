@@ -11,6 +11,8 @@ import {
   Divider,
   FormControlLabel,
   LinearProgress,
+  MenuItem,
+  TextField,
   Paper,
   Stack,
   Typography,
@@ -25,10 +27,13 @@ import {
   Health,
   MachineProfile,
   ScanFlags,
+  ProfileChoice,
   analyzePdf,
   cancelJob,
   downloadResult,
   getJobLog,
+  getSettings,
+  saveSettings,
   getHealth,
   getProfile,
   pollUntilDone,
@@ -111,6 +116,11 @@ export default function ScanConverter() {
   const [analyzing, setAnalyzing] = useState(false);
   // Профиль машины (фаза 3): на слабом ПК LLM-доочистку не предлагаем заранее.
   const [profile, setProfile] = useState<MachineProfile | null>(null);
+  // Выбор пользователя: «Автоматически» или конкретный профиль. Автовыбор —
+  // поведение по умолчанию, но на своей машине человек вправе его изменить.
+  const [profileChoice, setProfileChoice] = useState<ProfileChoice>("auto");
+  // Профиль задан переменной окружения — выбор не применится, объясняем это.
+  const [profileLocked, setProfileLocked] = useState(false);
   // Предупреждение до начала работы: текстовый слой (п.1.5) или нехватка
   // памяти под этот файл (п.3.4). Не ошибка — конвертацию не запрещаем.
   const [warning, setWarning] = useState<string | null>(null);
@@ -141,6 +151,14 @@ export default function ScanConverter() {
       })
       .catch(() => {
         // Профиль не критичен: оставляем значения по умолчанию.
+      });
+    getSettings()
+      .then((s) => {
+        setProfileChoice((s.override.profile as ProfileChoice) ?? "auto");
+        setProfileLocked(s.locked_by_env);
+      })
+      .catch(() => {
+        // Настройки не критичны: останется «Автоматически».
       });
     // Готовность окружения спрашиваем тем же разом: эндпоинт кэширует ответ,
     // а пользователь узнаёт о нехватке языков или моделей до работы, а не после.
@@ -236,6 +254,22 @@ export default function ScanConverter() {
       setBusy(false);
       setTrouble(null);
       setActiveJob(null);
+    }
+  }
+
+  // Смена профиля: сохраняем на сервере, чтобы выбор пережил перезапуск, и
+  // сразу перечитываем профиль — от него зависит дефолт доочистки.
+  async function changeProfile(choice: ProfileChoice) {
+    setProfileChoice(choice);
+    try {
+      const saved = await saveSettings({ profile: choice });
+      setProfileLocked(saved.locked_by_env);
+      const p = await getProfile();
+      setProfile(p);
+      setFlags((prev) => ({ ...prev, iim: p.llm_default }));
+    } catch (e) {
+      setStatusKind("error");
+      setStatus(`Настройку не удалось сохранить: ${(e as Error).message}`);
     }
   }
 
@@ -567,6 +601,29 @@ export default function ScanConverter() {
                     " здесь или запустить кнопкой уже после конвертации."}
                 </Typography>
               )}
+              {/* Выбор профиля: по умолчанию решает машина, но человек на своей
+                  машине вправе сказать «мне нужно быстрее» или «не грузи
+                  процессор». Выбор хранится на сервере и переживает
+                  перезапуск. */}
+              <TextField
+                select
+                size="small"
+                label="Режим использования ресурсов"
+                value={profileChoice}
+                onChange={(e) => changeProfile(e.target.value as ProfileChoice)}
+                disabled={busy || profileLocked}
+                helperText={
+                  profileLocked
+                    ? "Задано переменной окружения CONVERTER_PROFILE — выбор здесь не применится."
+                    : "Экономный медленнее на ~20%, но занимает примерно на 500 МБ меньше памяти."
+                }
+                sx={{ mb: 2, minWidth: 320 }}
+              >
+                <MenuItem value="auto">Автоматически по компьютеру</MenuItem>
+                <MenuItem value="lean">Экономный</MenuItem>
+                <MenuItem value="balanced">Сбалансированный</MenuItem>
+                <MenuItem value="full">Полный</MenuItem>
+              </TextField>
               <Stack spacing={1}>
                 {FLAG_DEFS.map((f) => {
                   // Для «обратных» флагов галочка показывает противоположное значение.

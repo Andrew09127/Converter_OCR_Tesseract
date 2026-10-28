@@ -123,8 +123,16 @@ def detect() -> Profile:
 
 
 def resolve(name: str | None = None) -> Profile:
-    """Профиль: аргумент → `CONVERTER_PROFILE` → по машине."""
-    raw = (name or os.environ.get("CONVERTER_PROFILE", "")).strip().lower()
+    """Профиль: аргумент → `CONVERTER_PROFILE` → выбор пользователя → машина.
+
+    Выбор пользователя (диалог настроек приложения) хранится в
+    `docling_dev/settings.py`; окружение старше его, потому что им гоняются
+    замеры и A/B — сохранённый файл не должен их перебивать.
+    """
+    raw = (name or "").strip().lower()
+    if not raw:
+        from .settings import profile_name
+        raw = (profile_name() or "").strip().lower()
     if raw:
         if raw in PROFILES:
             return PROFILES[raw]
