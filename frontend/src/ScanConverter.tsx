@@ -22,10 +22,12 @@ import DescriptionIcon from "@mui/icons-material/Description";
 import CloseIcon from "@mui/icons-material/Close";
 import {
   ConvertMode,
+  Health,
   MachineProfile,
   ScanFlags,
   analyzePdf,
   downloadResult,
+  getHealth,
   getProfile,
   pollUntilDone,
   startConversion,
@@ -110,6 +112,12 @@ export default function ScanConverter() {
   // Предупреждение до начала работы: текстовый слой (п.1.5) или нехватка
   // памяти под этот файл (п.3.4). Не ошибка — конвертацию не запрещаем.
   const [warning, setWarning] = useState<string | null>(null);
+  // Готовность окружения (п.4.4): если нет языков Tesseract или не собраны
+  // модели, сказать об этом надо СРАЗУ, а не после загрузки файла.
+  const [health, setHealth] = useState<Health | null>(null);
+  // Связь с сервером потеряна, идут повторы опроса (п.4.4). Не ошибка: задача
+  // на сервере, скорее всего, продолжает идти.
+  const [trouble, setTrouble] = useState<string | null>(null);
   // Готовая скан-задача: по ней доступна доочистка текста (п.3.2).
   const [doneJob, setDoneJob] = useState<{ id: string; filename: string } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -124,6 +132,13 @@ export default function ScanConverter() {
       })
       .catch(() => {
         // Профиль не критичен: оставляем значения по умолчанию.
+      });
+    // Готовность окружения спрашиваем тем же разом: эндпоинт кэширует ответ,
+    // а пользователь узнаёт о нехватке языков или моделей до работы, а не после.
+    getHealth()
+      .then((h) => setHealth(h))
+      .catch(() => {
+        // Сервер не ответил — это покажется при первом же действии.
       });
   }, []);
 
@@ -174,11 +189,15 @@ export default function ScanConverter() {
     setStatus("Загрузка файла…");
     try {
       const jobId = await startConversion(mode, file, mode === "scan" ? flags : undefined);
-      const final = await pollUntilDone(jobId, (s) => {
-        setProgress(Math.round(s.progress * 100));
-        setStatus(`Обработка: ${s.stage}`);
-        if (s.warning) setWarning(s.warning);
-      });
+      const final = await pollUntilDone(
+        jobId,
+        (s) => {
+          setProgress(Math.round(s.progress * 100));
+          setStatus(`Обработка: ${s.stage}`);
+          if (s.warning) setWarning(s.warning);
+        },
+        setTrouble,
+      );
       if (final.status === "done") {
         await downloadResult(jobId, final.filename);
         setProgress(100);
@@ -197,6 +216,7 @@ export default function ScanConverter() {
       setStatus(`Ошибка: ${(e as Error).message}`);
     } finally {
       setBusy(false);
+      setTrouble(null);
     }
   }
 
@@ -210,10 +230,14 @@ export default function ScanConverter() {
     setStatus("Запускаем доочистку текста…");
     try {
       await startPolish(doneJob.id);
-      const final = await pollUntilDone(doneJob.id, (s) => {
-        setProgress(Math.round(s.progress * 100));
-        setStatus(`Обработка: ${s.stage}`);
-      });
+      const final = await pollUntilDone(
+        doneJob.id,
+        (s) => {
+          setProgress(Math.round(s.progress * 100));
+          setStatus(`Обработка: ${s.stage}`);
+        },
+        setTrouble,
+      );
       await downloadResult(doneJob.id, final.filename);
       setProgress(100);
       setStatusKind(final.error ? "error" : "success");
@@ -228,6 +252,7 @@ export default function ScanConverter() {
       setStatus(`Ошибка: ${(e as Error).message}`);
     } finally {
       setBusy(false);
+      setTrouble(null);
     }
   }
 
@@ -298,6 +323,24 @@ export default function ScanConverter() {
           </Box>
 
           <Alert severity={statusKind} variant="outlined">{status}</Alert>
+
+          {/* Связь потеряна, но задача на сервере идёт: повторы опроса (п.4.4).
+              Это не ошибка конвертации, поэтому своя плашка, а не красная. */}
+          {trouble && (
+            <Alert severity="warning" variant="outlined">{trouble}</Alert>
+          )}
+
+          {/* Окружение не готово (п.4.4): нет языков Tesseract, не собраны
+              модели, кончается память или диск. Сказать это надо до работы. */}
+          {health && !health.ready && (
+            <Alert severity="error" variant="outlined">
+              Окружение не готово: {health.problems.join(", ")}.
+              {health.items
+                .filter((i) => i.critical && !i.ok)
+                .map((i) => ` ${i.name}: ${i.detail}`)
+                .join("")}
+            </Alert>
+          )}
 
           {/* Предупреждение (текстовый слой в скан-режиме или нехватка памяти):
               не ошибка, конвертация идёт — поэтому отдельной плашкой. */}

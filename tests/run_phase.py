@@ -10,10 +10,12 @@ tests/run_phase.py
   3. tests/quality.py check      — снимок качества (регресс текста/структуры);
   4. tests/highlights.py check   — точность подсветки по локальной разметке
                                    (пропускается, если разметки нет);
-  4. tests/perf.py check         — снимок скорости и ресурсов;
-  5. tests/golden.py check       — эталоны вёрстки (информативно: эталоны
-                                   устарели из-за дрейфа OCR с июля, их
-                                   переснятие требует явного подтверждения).
+  5. tests/perf.py check         — снимок скорости и ресурсов;
+  6. tests/frontend_api.py       — сетевая логика фронта: различение сбоев и
+                                   повторы опроса (пропускается без Node);
+  7. tests/golden.py check       — эталоны вёрстки: ЕДИНСТВЕННЫЙ гейт на
+                                   порядок чтения (quality его не ловит).
+                                   Пропускается, если эталонов нет.
 
 Использование:
     python tests/run_phase.py --phase 1
@@ -43,7 +45,7 @@ PHASE_CHECKS: dict[int, tuple[str, ...]] = {
     1: ("pytest", "env", "quality", "highlights", "perf"),
     2: ("pytest", "env", "quality", "perf"),
     3: ("pytest", "env", "perf", "quality"),
-    4: ("pytest", "env", "quality", "highlights"),
+    4: ("pytest", "env", "front", "quality", "highlights"),
 }
 
 
@@ -68,7 +70,7 @@ def main() -> int:
 
     checks = PHASE_CHECKS[args.phase]
     if args.quick:
-        checks = tuple(c for c in checks if c in ("pytest", "env"))
+        checks = tuple(c for c in checks if c in ("pytest", "env", "front"))
 
     plan: list[tuple[str, list[str], bool]] = []
     if "pytest" in checks:
@@ -76,6 +78,9 @@ def main() -> int:
                      [PY, "-m", "pytest", "docling_dev/tests/", "-q"], True))
     if "env" in checks:
         plan.append(("окружение (smoke_env)", [PY, "tests/smoke_env.py"], True))
+    if "front" in checks:
+        plan.append(("сетевая логика фронта (frontend_api)",
+                     [PY, "tests/frontend_api.py"], True))
     if "quality" in checks:
         plan.append(("качество (quality check)",
                      [PY, "tests/quality.py", "check", "--groups", args.groups], True))
@@ -85,8 +90,9 @@ def main() -> int:
     if "perf" in checks:
         plan.append(("скорость и ресурсы (perf check)",
                      [PY, "tests/perf.py", "check", "--groups", args.groups], True))
+    # golden обязателен: это единственная проверка, ловящая порядок чтения.
     plan.append(("эталоны вёрстки (golden check)",
-                 [PY, "tests/golden.py", "check"], False))
+                 [PY, "tests/golden.py", "check"], True))
 
     results = [run(t, c, r) for t, c, r in plan]
 
