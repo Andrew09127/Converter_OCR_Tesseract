@@ -2971,3 +2971,144 @@ def test_polish_missing_file_is_410(polish_client):
     client, job_id, dev_api, _calls, docx = polish_client
     docx.unlink()
     assert client.post(f"/convert/polish/{job_id}").status_code == 410
+
+
+#  ПРОГРЕВ МОДЕЛЕЙ ПО ЗАПРОСУ ПРИЛОЖЕНИЯ (п.4.0)
+
+
+@pytest.fixture
+def warm_client(monkeypatch):
+    """Клиент к роутеру с подменёнными шагами прогрева и синхронным исполнителем.
+
+    Настоящие шаги грузят модели на полторы секунды и четверть гигабайта —
+    проверяем мы не их, а поведение маршрута.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from docling_dev import api as dev_api
+    from docling_dev import warmup as warm
+
+    calls: list[str] = []
+
+    def step(name, boom=False):
+        def run():
+            calls.append(name)
+            if boom:
+                raise RuntimeError(f"шаг {name} не прошёл")
+        return run
+
+    monkeypatch.setattr(warm, "_STEPS", (("models", step("models")),
+                                         ("scipy", step("scipy")),
+                                         ("dictionary", step("dictionary"))))
+    # Задачи в тестах выполняем сразу и в этом же потоке: иначе пришлось бы
+    # ждать поток, а проверяем мы постановку, а не планировщик.
+    monkeypatch.setattr(dev_api._EXECUTOR, "submit", lambda fn, *a: fn(*a))
+    warm.reset()
+
+    app = FastAPI()
+    app.include_router(dev_api.router)
+    yield TestClient(app), dev_api, warm, calls, step
+    warm.reset()
+
+
+def test_warmup_route_exists_and_schedules(warm_client):
+    """Главное в п.4.0: маршрут ЕСТЬ. Приложение дёргало его и получало 404."""
+    client, _api, _warm, calls, _step = warm_client
+    r = client.post("/convert/warmup")
+    assert r.status_code == 202
+    body = r.json()
+    assert body["scheduled"] is True
+    assert body["state"] == "ready"              # исполнитель синхронный
+    assert body["error"] is None
+    assert calls == ["models", "scipy", "dictionary"]
+
+
+def test_warmup_accepts_get_too(warm_client):
+    """GET нужен, чтобы маршрут проверялся из браузера и health-цикла обёртки."""
+    client, *_ = warm_client
+    assert client.get("/convert/warmup").status_code == 202
+
+
+def test_warmup_second_call_does_not_warm_again(warm_client):
+    """Приложение дёргает прогрев без оглядки на прошлые вызовы: повторный
+    вызов обязан быть бесплатным."""
+    client, _api, _warm, calls, _step = warm_client
+    assert client.post("/convert/warmup").status_code == 202
+    r = client.post("/convert/warmup")
+    assert r.status_code == 200
+    assert r.json()["scheduled"] is False
+    assert r.json()["state"] == "ready"
+    assert len(calls) == 3                        # ровно один проход шагов
+
+
+def test_warmup_off_does_nothing(monkeypatch, warm_client):
+    """На слабой машине +233 МБ резидентно не нужны: CONVERTER_WARMUP=off."""
+    client, _api, _warm, calls, _step = warm_client
+    monkeypatch.setenv("CONVERTER_WARMUP", "off")
+    r = client.post("/convert/warmup")
+    assert r.status_code == 200
+    assert r.json()["state"] == "skipped"
+    assert calls == []
+
+
+def test_warmup_skips_while_job_running(warm_client):
+    """Воркер один: позади реальной задачи прогрев бесполезен (она сама всё
+    загрузит), а впереди его не поставить."""
+    client, dev_api, _warm, calls, _step = warm_client
+    with dev_api._JOBS_LOCK:
+        dev_api._JOBS["занят"] = {"status": "running"}
+    try:
+        r = client.post("/convert/warmup")
+    finally:
+        with dev_api._JOBS_LOCK:
+            dev_api._JOBS.pop("занят", None)
+    assert r.status_code == 200
+    assert r.json()["state"] == "busy"
+    assert calls == []
+
+
+def test_warmup_failed_step_does_not_block_others(monkeypatch, warm_client):
+    """Прогрев необязателен: упавший шаг не отменяет остальные и не ломает
+    конвертацию — она просто заплатит холодный старт."""
+    client, _api, warm, calls, step = warm_client
+    monkeypatch.setattr(warm, "_STEPS", (("models", step("models", boom=True)),
+                                         ("scipy", step("scipy")),
+                                         ("dictionary", step("dictionary"))))
+    r = client.post("/convert/warmup")
+    assert r.status_code == 202
+    body = r.json()
+    assert body["state"] == "ready"               # два шага из трёх прошли
+    assert "шаг models не прошёл" in body["error"]
+    assert calls == ["models", "scipy", "dictionary"]
+
+
+def test_warmup_all_steps_failed_is_reported(monkeypatch, warm_client):
+    """Если не прошло НИЧЕГО — это failed, а не ready: иначе дефект окружения
+    так и останется незамеченным, как было с 404."""
+    client, _api, warm, _calls, step = warm_client
+    monkeypatch.setattr(warm, "_STEPS", (("models", step("models", boom=True)),
+                                         ("scipy", step("scipy", boom=True))))
+    body = client.post("/convert/warmup").json()
+    assert body["state"] == "failed"
+    assert body["error"].count(";") == 1          # обе причины, не только первая
+
+
+def test_warmup_does_not_convert_stub_file():
+    """Замерено: прогон файла-заготовки стоил 6 s в общей однопоточной очереди,
+    и пользователь, нажавший кнопку сразу, ждал ДОЛЬШЕ, чем без прогрева.
+    Прогрев обязан оставаться дешёвым — только загрузка моделей."""
+    import inspect
+    from docling_dev import warmup as warm
+    src = inspect.getsource(warm)
+    body = src.split('"""', 2)[-1]                # без вводного docstring
+    assert ".convert(" not in body
+    assert "initialize_pipeline" in body
+
+
+def test_warmup_warms_the_cached_converter():
+    """Греть надо ТОТ ЖЕ конвертер, который возьмёт задача: иначе в памяти
+    окажутся два набора моделей."""
+    import inspect
+    from docling_dev import warmup as warm
+    src = inspect.getsource(warm._warm_models)
+    assert "_get_scan_converter" in src

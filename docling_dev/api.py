@@ -27,7 +27,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Form, HTTPException, UploadFile, File
+from fastapi import (APIRouter, BackgroundTasks, File, Form, HTTPException,
+                     Response, UploadFile)
 from fastapi.responses import FileResponse
 
 log = logging.getLogger(__name__)
@@ -66,6 +67,13 @@ def _set(job_id: str, **changes) -> None:
     with _JOBS_LOCK:
         if job_id in _JOBS:
             _JOBS[job_id].update(changes)
+
+
+def _busy() -> bool:
+    """True если есть задача в очереди или в работе. Воркер один, поэтому
+    любая такая задача означает, что исполнитель занят."""
+    with _JOBS_LOCK:
+        return any(j.get("status") in ("queued", "running") for j in _JOBS.values())
 
 
 def _get_scan_converter(ocr_preprocess: bool):
@@ -241,6 +249,43 @@ async def convert_profile():
         "ram_gb": round(m["ram_gb"], 1),
         "free_gb": round(m["free_gb"], 1),
     }
+
+
+@router.post("/warmup")
+@router.get("/warmup")
+async def convert_warmup(response: Response):
+    """Прогрев моделей (пункт 4.0). Приложение sberAct дёргает этот маршрут при
+    запуске convert-шага и до сих пор получало 404 — прогрева не происходило, и
+    первый скан платил холодный старт внутри задачи.
+
+    Fire-and-forget: отвечаем сразу, греем в фоне. GET принимается наравне с
+    POST — так маршрут проверяется из браузера и из health-цикла обёртки.
+
+    Поля ответа: `state` (cold|warming|ready|failed|skipped|busy), `scheduled` —
+    поставили ли прогрев в этот раз, `seconds` и `steps` — замеры прошедшего
+    прогрева, `error` — текст, если какой-то шаг не прошёл.
+    """
+    from . import warmup as warm
+
+    def answer(state: str, scheduled: bool) -> dict:
+        st = warm.state()
+        return {"state": state, "scheduled": scheduled,
+                "seconds": st["seconds"], "steps": st["steps"],
+                "error": st["error"]}
+
+    if warm.disabled():
+        return answer("skipped", False)
+    current = warm.state()["state"]
+    if current in ("warming", "ready"):
+        return answer(current, False)
+    if _busy():
+        # Воркер один и задачи сериализованы: позади реальной конвертации
+        # прогрев бесполезен (она сама всё загрузит), а впереди его не
+        # поставить. Пусть приложение дёрнет маршрут ещё раз позже.
+        return answer("busy", False)
+    _EXECUTOR.submit(warm.warmup)
+    response.status_code = 202
+    return answer(warm.state()["state"], True)
 
 
 @router.post("/analyze")
