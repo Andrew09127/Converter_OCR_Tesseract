@@ -3570,7 +3570,7 @@ def _is_native_pdf(pdf_path: Path) -> bool:
     return False
 
 
-def convert_pdf(
+def convert_pdf_checked(
     pdf_path: Path,
     docx_path: Path,
     converter,
@@ -3580,7 +3580,17 @@ def convert_pdf(
     llm: bool = False,
     llm_model: str = "",
     ink_bold: bool = False,
-) -> bool:
+) -> None:
+    """Конвертация, которая ОБЪЯСНЯЕТ отказ: при неудаче бросает ConvertError
+    с кодом, русским текстом и подсказкой (пункт 4.2).
+
+    Обёртка `convert_pdf` ниже сохраняет прежний контракт `bool` для батча и
+    CLI; HTTP-слой зовёт эту версию, потому что причину нужно показать."""
+    from .errors import ConvertError, check_pdf, check_temp_dir, classify
+    # Дешёвые проверки до тяжёлой работы: час распознавания не должен падать
+    # на том, что видно за миллисекунды.
+    check_pdf(pdf_path)
+    check_temp_dir()
     log.info("  Конвертация: %s", pdf_path.name)
     try:
         # Пункт 1.5: нативный PDF в скан-режиме — не ошибка, но пользователь
@@ -3640,9 +3650,37 @@ def convert_pdf(
                 correct_highlighted(doc, llm_model or None)
         doc.save(str(docx_path))
         log.info("  ✓ %s", docx_path.name)
-        return True
+    except ConvertError:
+        raise
     except Exception as exc:
-        log.error("  ✗ %s: %s", pdf_path.name, exc, exc_info=True)
+        err = classify(exc)
+        log.error("  ✗ %s: [%s] %s", pdf_path.name, err.code, err.detail,
+                  exc_info=True)
+        raise err from exc
+
+
+def convert_pdf(
+    pdf_path: Path,
+    docx_path: Path,
+    converter,
+    ocr_reader=None,
+    use_word_order: bool = True,
+    highlight: bool = True,
+    llm: bool = False,
+    llm_model: str = "",
+    ink_bold: bool = False,
+) -> bool:
+    """Прежний контракт: True/False. Причина отказа уходит в лог с кодом."""
+    from .errors import ConvertError
+    try:
+        convert_pdf_checked(pdf_path, docx_path, converter,
+                            ocr_reader=ocr_reader,
+                            use_word_order=use_word_order,
+                            highlight=highlight, llm=llm,
+                            llm_model=llm_model, ink_bold=ink_bold)
+        return True
+    except ConvertError as err:
+        log.error("  ✗ %s: [%s] %s", pdf_path.name, err.code, err.text())
         return False
 
 

@@ -1,5 +1,28 @@
 export type ConvertMode = "scan" | "native";
 
+// Ошибка конвертации с машинным кодом (п.4.2). Сервер отдаёт detail объектом
+// {code, message, hint}, и показать надо именно их, а не "[object Object]".
+export interface ConvertFailure extends Error {
+  code?: string;
+  hint?: string;
+}
+
+async function failure(res: Response, fallback: string): Promise<ConvertFailure> {
+  const body = await res.json().catch(() => ({} as any));
+  const d = (body as any)?.detail;
+  if (d && typeof d === "object") {
+    const err = new Error(
+      [d.message, d.hint].filter(Boolean).join(" "),
+    ) as ConvertFailure;
+    err.code = d.code;
+    err.hint = d.hint;
+    return err;
+  }
+  return new Error(
+    typeof d === "string" && d ? d : `${fallback} (${res.status})`,
+  ) as ConvertFailure;
+}
+
 export interface ScanFlags {
   no_highlight: boolean;
   word_order: boolean;
@@ -19,10 +42,7 @@ export async function analyzePdf(file: File): Promise<AnalyzeResult> {
   const form = new FormData();
   form.append("file", file);
   const res = await fetch("/convert/analyze", { method: "POST", body: form });
-  if (!res.ok) {
-    const detail = await res.json().catch(() => ({}));
-    throw new Error(detail.detail || `Анализ не удался (${res.status})`);
-  }
+  if (!res.ok) throw await failure(res, "Анализ не удался");
   return (await res.json()) as AnalyzeResult;
 }
 
@@ -33,6 +53,10 @@ export interface JobStatus {
   progress: number;
   filename: string;
   error: string | null;
+  // Пункт 4.2: машинный код причины и что делать. Текст `error` уже содержит
+  // и то и другое одной строкой — код нужен интерфейсу для своих решений.
+  error_code?: string | null;
+  error_hint?: string | null;
   // Предупреждение до начала работы: текстовый слой в скан-режиме (п.1.5) или
   // нехватка памяти под этот файл (п.3.4). Не ошибка — режим не запрещается.
   warning?: string | null;
@@ -65,10 +89,7 @@ export async function getProfile(): Promise<MachineProfile> {
 // повторяется, работа идёт по сохранённым в файле жёлтым подсветкам.
 export async function startPolish(jobId: string): Promise<void> {
   const res = await fetch(`/convert/polish/${jobId}`, { method: "POST" });
-  if (!res.ok) {
-    const detail = await res.json().catch(() => ({}));
-    throw new Error(detail.detail || `Доочистка не запустилась (${res.status})`);
-  }
+  if (!res.ok) throw await failure(res, "Доочистка не запустилась");
 }
 
 // Запускает конвертацию. Для скана прикладывает флаги, для нативного — только файл.
@@ -87,10 +108,7 @@ export async function startConversion(
     form.append("ocr_preprocess", String(flags.ocr_preprocess));
   }
   const res = await fetch(`/convert/${mode}`, { method: "POST", body: form });
-  if (!res.ok) {
-    const detail = await res.json().catch(() => ({}));
-    throw new Error(detail.detail || `Ошибка запуска (${res.status})`);
-  }
+  if (!res.ok) throw await failure(res, "Ошибка запуска");
   const data = await res.json();
   return data.job_id as string;
 }

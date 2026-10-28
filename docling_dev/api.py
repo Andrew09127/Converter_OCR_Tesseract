@@ -69,6 +69,29 @@ def _set(job_id: str, **changes) -> None:
             _JOBS[job_id].update(changes)
 
 
+def _fail(job_id: str, err) -> None:
+    """Записать типизированную ошибку в задачу (пункт 4.2).
+
+    Поле `error` остаётся человеческой строкой — его интерфейс уже показывает;
+    рядом появляются `error_code` и `error_hint`, по которым чужой интерфейс
+    (sberAct) может решать сам, не разбирая русский текст.
+    """
+    _set(job_id, status="error", stage="Ошибка", error=err.text(),
+         error_code=err.code, error_hint=err.hint,
+         error_detail=err.detail or None)
+    log.error("api: задача %s — [%s] %s", job_id, err.code,
+              err.detail or err.message)
+
+
+def _http_error(err, status_code: int = 400) -> HTTPException:
+    """ConvertError → HTTPException со структурным detail.
+
+    Обработчик исключений уровня приложения не поставить: в sberAct подключают
+    только наш роутер, своё приложение они строят сами.
+    """
+    return HTTPException(status_code=status_code, detail=err.as_dict())
+
+
 def _busy() -> bool:
     """True если есть задача в очереди или в работе. Воркер один, поэтому
     любая такая задача означает, что исполнитель занят."""
@@ -142,6 +165,7 @@ def _page_count(pdf_path: Path) -> int:
 def _run_scan(job_id: str, pdf_path: Path, docx_path: Path, flags: dict) -> None:
     """Прогон скана через Docling-пайплайн (медленный путь)."""
     from . import progress as page_progress
+    from .errors import ConvertError, classify
     try:
         _set(job_id, status="running", stage="Анализ скана…", progress=0.1)
         converter = _get_scan_converter(flags["ocr_preprocess"])
@@ -165,9 +189,9 @@ def _run_scan(job_id: str, pdf_path: Path, docx_path: Path, flags: dict) -> None
         # файле в 7 страниц), поэтому текст должен объяснять, чего ждём.
         _set(job_id, stage="Распознавание страниц…", progress=_PROGRESS_FROM)
         page_progress.start(total, _on_page)
-        from . import convert_pdf
+        from . import convert_pdf_checked
         try:
-            ok = convert_pdf(
+            convert_pdf_checked(
                 pdf_path, docx_path, converter,
                 ocr_reader=ocr_reader,
                 use_word_order=flags["word_order"],
@@ -178,17 +202,20 @@ def _run_scan(job_id: str, pdf_path: Path, docx_path: Path, flags: dict) -> None
         finally:
             # Обязательно: иначе следующая задача досчитает страницы в эту.
             page_progress.finish()
-        if ok and docx_path.exists():
+        if docx_path.exists():
             _set(job_id, status="done", stage="Готово", progress=1.0)
         else:
-            _set(job_id, status="error", stage="Ошибка", error="Конвертация не удалась")
-    except Exception as e:                       # noqa: BLE001 — отдаём текст клиенту
+            # Исключения не было, а файла нет — так быть не должно.
+            _fail(job_id, ConvertError("INTERNAL",
+                                       "DOCX не создан, хотя ошибки не было"))
+    except Exception as exc:                     # noqa: BLE001 — отдаём текст клиенту
         log.exception("api: ошибка прогона скана %s", job_id)
-        _set(job_id, status="error", stage="Ошибка", error=str(e))
+        _fail(job_id, classify(exc))
 
 
 def _run_native(job_id: str, pdf_path: Path, docx_path: Path) -> None:
     """Прогон нативного PDF через pdf2docx (быстрый путь, без флагов)."""
+    from .errors import ConvertError, classify
     try:
         _set(job_id, status="running", stage="Конвертация PDF…", progress=0.2)
         # Берём только одиночную конвертацию — без батч-пайплайна, который удаляет исходники.
@@ -197,22 +224,25 @@ def _run_native(job_id: str, pdf_path: Path, docx_path: Path) -> None:
             input_folder=str(pdf_path.parent),
             output_folder=str(docx_path.parent),
         )
-        ok, _ = conv.convert_single_pdf(pdf_path, docx_path)
+        ok, msg = conv.convert_single_pdf(pdf_path, docx_path)
         if ok and docx_path.exists():
             _set(job_id, status="done", stage="Готово", progress=1.0)
         else:
-            _set(job_id, status="error", stage="Ошибка", error="Конвертация не удалась")
-    except Exception as e:                       # noqa: BLE001
+            # pdf2docx — внешний чёрный ящик: кода он не даёт, но текст отдаёт.
+            _fail(job_id, ConvertError("INTERNAL",
+                                       str(msg or "pdf2docx вернул отказ")))
+    except Exception as exc:                     # noqa: BLE001
         log.exception("api: ошибка прогона нативного PDF %s", job_id)
-        _set(job_id, status="error", stage="Ошибка", error=str(e))
+        _fail(job_id, classify(exc))
         
 #Приём загруженного файла
 
 def _accept_upload(file: UploadFile) -> tuple[str, Path, Path]:
     """Сохраняет загруженный PDF в папку задачи. Возвращает (job_id, pdf, docx)."""
+    from .errors import ConvertError, check_pdf, check_temp_dir
     name = Path(file.filename or "document.pdf").name
     if not name.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Принимаются только PDF-файлы.")
+        raise _http_error(ConvertError("NOT_A_PDF", f"расширение файла: {name}"))
 
     job_id = uuid.uuid4().hex
     job_dir = _WORK_DIR / job_id
@@ -223,6 +253,15 @@ def _accept_upload(file: UploadFile) -> tuple[str, Path, Path]:
         shutil.copyfileobj(file.file, out)
 
     docx_path = job_dir / f"{Path(name).stem}.docx"
+    # Пункт 4.2: запароленный, битый или не-PDF файл виден за миллисекунды —
+    # отвечаем сразу и внятно, а не ставим в очередь задачу, которая упадёт
+    # через час распознавания.
+    try:
+        check_pdf(pdf_path)
+        check_temp_dir()
+    except ConvertError as err:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise _http_error(err) from err
     return job_id, pdf_path, docx_path
 
 
@@ -295,15 +334,22 @@ async def analyze_pdf(file: UploadFile = File(...)):
     режима в интерфейсе. Синхронно, без OCR и без фоновых задач — только чтение
     текстового слоя. Временный файл удаляется сразу после анализа.
     """
+    from .errors import ConvertError, check_pdf
     name = Path(file.filename or "document.pdf").name
     if not name.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Принимаются только PDF-файлы.")
+        raise _http_error(ConvertError("NOT_A_PDF", f"расширение файла: {name}"))
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="analyze_", dir=_WORK_DIR))
     pdf_path = tmp_dir / name
     try:
         with pdf_path.open("wb") as out:
             shutil.copyfileobj(file.file, out)
+        # Анализ идёт при ВЫБОРЕ файла, то есть это самый ранний момент, когда
+        # можно сказать про пароль или повреждение — до нажатия «Конвертировать».
+        try:
+            check_pdf(pdf_path)
+        except ConvertError as err:
+            raise _http_error(err) from err
         from .pdf_classifier import classify_pdf
         return classify_pdf(pdf_path)
     finally:
@@ -378,7 +424,12 @@ async def convert_status(job_id: str):
             raise HTTPException(status_code=404, detail="Задача не найдена.")
         return {"job_id": job_id, "status": job["status"], "stage": job["stage"],
                 "progress": job["progress"], "filename": job["filename"],
-                "error": job["error"], "warning": job.get("warning"),
+                "error": job["error"],
+                # Пункт 4.2: машинный код и что делать — чтобы интерфейс не
+                # разбирал русский текст и не показывал «Failed to fetch».
+                "error_code": job.get("error_code"),
+                "error_hint": job.get("error_hint"),
+                "warning": job.get("warning"),
                 # Для кнопки «Доочистить текст» (п.3.2): есть ли смысл её
                 # показывать и не нажата ли она уже.
                 "mode": job.get("mode"), "polished": bool(job.get("polished")),
@@ -402,12 +453,19 @@ def _run_polish(job_id: str, docx_path: Path) -> None:
         _set(job_id, status="done", stage=f"Доочистка: исправлено {fixed}",
              progress=1.0, polished=True, polish_fixed=fixed)
         log.info("polish: задача %s, исправлено %d фрагментов", job_id, fixed)
-    except Exception as e:                           # noqa: BLE001
+    except Exception as exc:                         # noqa: BLE001
         log.exception("api: ошибка доочистки %s", job_id)
+        from .errors import ConvertError, classify
+        err = classify(exc)
+        if err.code == "INTERNAL":
+            # Доочистка целиком про LLM: что бы ни сломалось внутри неё,
+            # сказать надо именно это, а не «внутренняя ошибка конвертера».
+            err = ConvertError("LLM_UNAVAILABLE", err.detail)
         # Файл остаётся прежним и его по-прежнему можно скачать, поэтому
         # задача снова `done`, а не `error`: сломалась доочистка, не результат.
         _set(job_id, status="done", stage="Доочистка не удалась", progress=1.0,
-             error=str(e))
+             error=err.text(), error_code=err.code, error_hint=err.hint,
+             error_detail=err.detail or None)
 
 
 @router.post("/polish/{job_id}")

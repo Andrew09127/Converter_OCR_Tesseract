@@ -2864,7 +2864,7 @@ def test_converter_releases_document_before_llm():
     2887 → 2823 МБ."""
     import inspect
     from docling_dev import converter as conv_mod
-    src = inspect.getsource(conv_mod.convert_pdf)
+    src = inspect.getsource(conv_mod.convert_pdf_checked)
     build_at = src.index("doc = build_docx")
     del_at = src.index("del dl_doc")
     llm_at = src.index("correct_highlighted")
@@ -3112,3 +3112,271 @@ def test_warmup_warms_the_cached_converter():
     from docling_dev import warmup as warm
     src = inspect.getsource(warm._warm_models)
     assert "_get_scan_converter" in src
+
+
+#  ТИПИЗИРОВАННЫЕ ОШИБКИ КОНВЕРТАЦИИ (п.4.2)
+
+
+@pytest.fixture
+def pdfs(tmp_path):
+    """Набор файлов: нормальный, запароленный, обрезанный, не-PDF, пустой."""
+    import fitz
+    out = {}
+
+    doc = fitz.open()
+    doc.new_page()
+    good = tmp_path / "ok.pdf"
+    doc.save(str(good))
+    doc.close()
+    out["ok"] = good
+
+    doc = fitz.open()
+    doc.new_page()
+    enc = tmp_path / "enc.pdf"
+    doc.save(str(enc), encryption=fitz.PDF_ENCRYPT_AES_256,
+             user_pw="секрет", owner_pw="секрет")
+    doc.close()
+    out["encrypted"] = enc
+
+    # Обрезанный файл: заголовок %PDF на месте, структуры нет.
+    broken = tmp_path / "broken.pdf"
+    broken.write_bytes(good.read_bytes()[:120])
+    out["corrupted"] = broken
+
+    # Картинка с расширением .pdf — обычная ошибка пользователя.
+    alien = tmp_path / "картинка.pdf"
+    alien.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 300)
+    out["not_pdf"] = alien
+
+    empty = tmp_path / "empty.pdf"
+    empty.write_bytes(b"")
+    out["empty"] = empty
+    return out
+
+
+@pytest.mark.parametrize("key,code", [
+    ("encrypted", "PDF_ENCRYPTED"),
+    ("corrupted", "PDF_CORRUPTED"),
+    ("not_pdf", "NOT_A_PDF"),
+    ("empty", "NOT_A_PDF"),
+])
+def test_check_pdf_codes(pdfs, key, code):
+    """Причину отказа видно за миллисекунды — до часа распознавания."""
+    from docling_dev.errors import ConvertError, check_pdf
+    with pytest.raises(ConvertError) as exc:
+        check_pdf(pdfs[key])
+    assert exc.value.code == code
+    assert exc.value.hint                       # без «что делать» ошибка бесполезна
+
+
+def test_check_pdf_accepts_normal_file(pdfs):
+    from docling_dev.errors import check_pdf
+    check_pdf(pdfs["ok"])                       # не бросает
+
+
+def test_check_pdf_missing_file(tmp_path):
+    from docling_dev.errors import ConvertError, check_pdf
+    with pytest.raises(ConvertError) as exc:
+        check_pdf(tmp_path / "нет.pdf")
+    assert exc.value.code == "NOT_A_PDF"
+
+
+@pytest.mark.parametrize("exc,code", [
+    (MemoryError("Unable to allocate 2.3 GiB"), "OUT_OF_MEMORY"),
+    (RuntimeError("DefaultCPUAllocator: not enough memory"), "OUT_OF_MEMORY"),
+    (OSError(28, "No space left on device"), "DISK_FULL"),
+    (FileNotFoundError("[WinError 2] tesseract.exe not found"), "TESSERACT_MISSING"),
+    (RuntimeError("Error loading model.safetensors: HeaderTooLarge"),
+     "MODELS_BROKEN_PARTS"),
+    (RuntimeError("Max retries exceeded with url: huggingface.co"),
+     "MODELS_BROKEN_PARTS"),
+    (OSError("Failed to load model from file: qwen.gguf"), "LLM_UNAVAILABLE"),
+    (TimeoutError("operation timed out"), "TIMEOUT"),
+    (ValueError("что-то своё"), "INTERNAL"),
+])
+def test_classify_codes(exc, code):
+    """Классы исключений Docling, Tesseract и torch нам не принадлежат —
+    разбираем по тексту, и разбор должен быть закреплён тестом."""
+    from docling_dev.errors import classify
+    assert classify(exc).code == code
+
+
+def test_classify_keeps_original_text():
+    """Текст исходного исключения нужен разработчику: он уходит в `detail`,
+    а пользователю показывается человеческое сообщение."""
+    from docling_dev.errors import classify
+    err = classify(ValueError("странное место"))
+    assert "странное место" in err.detail
+    assert "странное место" not in err.message
+    assert err.as_dict()["code"] == "INTERNAL"
+
+
+def test_classify_passes_convert_error_through():
+    """Код, выставленный ближе к месту ошибки, переклассифицировать нельзя."""
+    from docling_dev.errors import ConvertError, classify
+    err = ConvertError("PDF_ENCRYPTED", "needs_pass=1")
+    assert classify(err) is err
+
+
+def test_convert_error_text_is_one_human_string():
+    """Поле `error` интерфейс уже показывает как строку — в ней должно быть и
+    что случилось, и что делать."""
+    from docling_dev.errors import ConvertError
+    err = ConvertError("DISK_FULL")
+    assert err.message in err.text() and err.hint in err.text()
+
+
+def test_convert_pdf_keeps_bool_contract(pdfs, tmp_path):
+    """Батч и CLI ждут True/False — обёртка не должна бросать."""
+    from docling_dev import convert_pdf
+    assert convert_pdf(pdfs["encrypted"], tmp_path / "out.docx", None) is False
+
+
+def test_convert_pdf_checked_raises_with_code(pdfs, tmp_path):
+    from docling_dev import ConvertError, convert_pdf_checked
+    with pytest.raises(ConvertError) as exc:
+        convert_pdf_checked(pdfs["encrypted"], tmp_path / "out.docx", None)
+    assert exc.value.code == "PDF_ENCRYPTED"
+
+
+@pytest.fixture
+def errors_client(monkeypatch):
+    """Клиент к роутеру с подменённой конвертацией: проверяем HTTP-слой."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from docling_dev import api as dev_api
+
+    monkeypatch.setattr(dev_api, "_get_scan_converter", lambda flag: object())
+    monkeypatch.setattr(dev_api._EXECUTOR, "submit", lambda fn, *a: fn(*a))
+    app = FastAPI()
+    app.include_router(dev_api.router)
+    yield TestClient(app), dev_api
+
+
+def test_scan_rejects_encrypted_pdf_before_queue(errors_client, pdfs):
+    """Запароленный файл не должен занимать очередь: отказ сразу и по делу."""
+    client, dev_api = errors_client
+    before = set(dev_api._JOBS)
+    with pdfs["encrypted"].open("rb") as f:
+        r = client.post("/convert/scan", files={"file": ("enc.pdf", f, "application/pdf")})
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert detail["code"] == "PDF_ENCRYPTED"
+    assert "парол" in detail["message"].lower()
+    assert detail["hint"]
+    assert set(dev_api._JOBS) == before          # задача не создана
+
+
+def test_scan_rejects_image_named_pdf(errors_client, pdfs):
+    client, _ = errors_client
+    with pdfs["not_pdf"].open("rb") as f:
+        r = client.post("/convert/scan",
+                        files={"file": ("картинка.pdf", f, "application/pdf")})
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "NOT_A_PDF"
+
+
+def test_scan_failure_reports_code_and_hint(errors_client, pdfs, monkeypatch):
+    """Главное в п.4.2: вместо «Конвертация не удалась» — причина и действие."""
+    client, dev_api = errors_client
+
+    def boom(*a, **kw):
+        raise MemoryError("Unable to allocate 2.34 GiB for an array")
+
+    monkeypatch.setattr("docling_dev.convert_pdf_checked", boom)
+    with pdfs["ok"].open("rb") as f:
+        job = client.post("/convert/scan",
+                          files={"file": ("ok.pdf", f, "application/pdf")}).json()
+    st = client.get(f"/convert/status/{job['job_id']}").json()
+    assert st["status"] == "error"
+    assert st["error_code"] == "OUT_OF_MEMORY"
+    assert st["error_hint"]
+    assert "памяти" in st["error"]
+    assert st["error"] != "Конвертация не удалась"
+
+
+def test_scan_failure_without_exception_is_internal(errors_client, pdfs, monkeypatch):
+    """Файла нет, а исключения не было — это наш дефект, и он должен быть
+    назван, а не выглядеть как ошибка пользователя."""
+    client, dev_api = errors_client
+    monkeypatch.setattr("docling_dev.convert_pdf_checked", lambda *a, **kw: None)
+    with pdfs["ok"].open("rb") as f:
+        job = client.post("/convert/scan",
+                          files={"file": ("ok.pdf", f, "application/pdf")}).json()
+    st = client.get(f"/convert/status/{job['job_id']}").json()
+    assert st["status"] == "error"
+    assert st["error_code"] == "INTERNAL"
+
+
+def test_polish_failure_is_llm_unavailable(polish_client, monkeypatch):
+    """Доочистка целиком про LLM: «внутренняя ошибка» тут никому не помогает."""
+    client, job_id, dev_api, _calls, _docx = polish_client
+
+    def boom(doc, model=None):
+        raise RuntimeError("не удалось открыть веса")
+
+    monkeypatch.setattr("docling_dev.llm_correct.correct_highlighted", boom)
+    client.post(f"/convert/polish/{job_id}")
+    st = client.get(f"/convert/status/{job_id}").json()
+    assert st["status"] == "done"                # документ цел и скачивается
+    assert st["error_code"] == "LLM_UNAVAILABLE"
+    assert "необязательна" in st["error_hint"]
+
+
+def test_cyrillic_filename_is_accepted(errors_client, pdfs, monkeypatch):
+    """РЕГРЕССИЯ (найдена настоящим прогоном): проверка не-ASCII путей
+    отвергала обычный файл с русским именем.
+
+    Tesseract НЕ видит ни загруженный PDF, ни результат — Docling отдаёт ему
+    картинку страницы во временном файле. Значит, имя файла может быть любым,
+    а проверять надо системный TEMP.
+    """
+    client, _dev_api = errors_client
+    monkeypatch.setattr("docling_dev.convert_pdf_checked", lambda *a, **kw: None)
+    with pdfs["ok"].open("rb") as f:
+        r = client.post("/convert/scan",
+                        files={"file": ("Умерший ким клим.pdf", f,
+                                        "application/pdf")})
+    assert r.status_code == 200
+    assert r.json()["job_id"]
+
+
+def test_check_temp_dir_flags_unusable_temp(monkeypatch, tmp_path):
+    """Не-ASCII TEMP без коротких имён 8.3 — распознавание даст пустые
+    страницы без объяснения, поэтому говорим об этом заранее."""
+    from docling_dev import errors
+    monkeypatch.setattr("tempfile.gettempdir", lambda: r"C:\Врем")
+    monkeypatch.setattr("docling_dev.pipeline._ascii_safe_path", lambda p: None)
+    with pytest.raises(errors.ConvertError) as exc:
+        errors.check_temp_dir()
+    assert exc.value.code == "PATH_NON_ASCII"
+    assert "TEMP" in exc.value.hint
+
+
+def test_check_temp_dir_accepts_short_name(monkeypatch):
+    """Короткое имя 8.3 — штатный обходной путь, он должен приниматься."""
+    from docling_dev import errors
+    monkeypatch.setattr("tempfile.gettempdir", lambda: r"C:\Врем")
+    monkeypatch.setattr("docling_dev.pipeline._ascii_safe_path",
+                        lambda p: r"C:\VREM~1")
+    errors.check_temp_dir()                      # не бросает
+
+
+def test_analyze_reports_encrypted_pdf(errors_client, pdfs):
+    """Анализ идёт при выборе файла — это самый ранний момент сказать про
+    пароль, ещё до нажатия «Конвертировать»."""
+    client, _ = errors_client
+    with pdfs["encrypted"].open("rb") as f:
+        r = client.post("/convert/analyze",
+                        files={"file": ("enc.pdf", f, "application/pdf")})
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "PDF_ENCRYPTED"
+
+
+def test_analyze_still_works_on_normal_pdf(errors_client, pdfs):
+    client, _ = errors_client
+    with pdfs["ok"].open("rb") as f:
+        r = client.post("/convert/analyze",
+                        files={"file": ("ok.pdf", f, "application/pdf")})
+    assert r.status_code == 200
+    assert r.json()["suggested"] in ("scan", "native")
