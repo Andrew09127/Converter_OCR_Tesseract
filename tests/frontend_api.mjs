@@ -143,6 +143,20 @@ try {
         e.message.includes("pdf2docx") && e.kind === "http", e.message);
 }
 
+// ── лог задачи (п.4.7) ──────────────────────────────────────────────────────
+mock(() => json(200, { job_id: "x", text: "строка лога" }));
+check("лог задачи читается", (await api.getJobLog("x")) === "строка лога");
+check("лог просит хвост, а не весь файл",
+      calls[0].includes("tail="), calls[0]);
+mock(() => json(404, { detail: "Лог этой задачи недоступен." }));
+try {
+  await api.getJobLog("x");
+  check("нет лога → ошибка", false);
+} catch (e) {
+  check("нет лога → kind=notfound и текст сервера",
+        e.kind === "notfound" && e.message.includes("недоступен"), e.message);
+}
+
 // ── готовность окружения (п.4.3) ────────────────────────────────────────────
 mock(() => json(200, { ready: false, problems: ["tesseract"], items: [] }));
 const h = await api.getHealth();

@@ -28,6 +28,7 @@ import {
   analyzePdf,
   cancelJob,
   downloadResult,
+  getJobLog,
   getHealth,
   getProfile,
   pollUntilDone,
@@ -119,6 +120,11 @@ export default function ScanConverter() {
   // Связь с сервером потеряна, идут повторы опроса (п.4.4). Не ошибка: задача
   // на сервере, скорее всего, продолжает идти.
   const [trouble, setTrouble] = useState<string | null>(null);
+  // Лог сорвавшейся задачи (п.4.7): показываем по кнопке «Подробности», это
+  // диагностика для разработчика, а не сообщение пользователю.
+  const [jobLog, setJobLog] = useState<string | null>(null);
+  // Последняя сорвавшаяся задача — по ней можно запросить лог.
+  const [failedJob, setFailedJob] = useState<string | null>(null);
   // Идущая задача: по ней доступна отмена (п.4.6).
   const [activeJob, setActiveJob] = useState<string | null>(null);
   // Готовая скан-задача: по ней доступна доочистка текста (п.3.2).
@@ -168,6 +174,8 @@ export default function ScanConverter() {
     setSuggestedMode(null);
     setWarning(null);
     setDoneJob(null);
+    setFailedJob(null);
+    setJobLog(null);
     setStatusKind("info");
     setStatus("Определяем тип документа…");
     setAnalyzing(true);
@@ -219,6 +227,7 @@ export default function ScanConverter() {
       } else {
         setStatusKind("error");
         setStatus(`Ошибка: ${final.error || "конвертация не удалась"}`);
+        setFailedJob(jobId);
       }
     } catch (e) {
       setStatusKind("error");
@@ -227,6 +236,17 @@ export default function ScanConverter() {
       setBusy(false);
       setTrouble(null);
       setActiveJob(null);
+    }
+  }
+
+  // Лог сорвавшейся задачи (п.4.7). Запрашиваем по кнопке: он может быть
+  // большим, а нужен редко.
+  async function showLog() {
+    if (!failedJob) return;
+    try {
+      setJobLog(await getJobLog(failedJob));
+    } catch (e) {
+      setJobLog(`Лог недоступен: ${(e as Error).message}`);
     }
   }
 
@@ -348,6 +368,28 @@ export default function ScanConverter() {
           </Box>
 
           <Alert severity={statusKind} variant="outlined">{status}</Alert>
+
+          {/* Лог сорвавшейся задачи (п.4.7): кнопка и, после нажатия, хвост
+              лога. Нужен разработчику — на машине пользователя общий лог
+              сервера недоступен. */}
+          {failedJob && !busy && (
+            <Box>
+              {jobLog === null ? (
+                <Button size="small" color="inherit" onClick={showLog}>
+                  Подробности
+                </Button>
+              ) : (
+                <Box
+                  component="pre"
+                  sx={{ m: 0, p: 1.5, maxHeight: 220, overflow: "auto",
+                        bgcolor: "#F3F4F6", borderRadius: 2, fontSize: 12,
+                        whiteSpace: "pre-wrap", wordBreak: "break-word" }}
+                >
+                  {jobLog}
+                </Box>
+              )}
+            </Box>
+          )}
 
           {/* Связь потеряна, но задача на сервере идёт: повторы опроса (п.4.4).
               Это не ошибка конвертации, поэтому своя плашка, а не красная. */}

@@ -128,6 +128,14 @@ export async function getProfile(): Promise<MachineProfile> {
   return (await res.json()) as MachineProfile;
 }
 
+// Лог задачи (п.4.7): что именно происходило во время работы. Это диагностика
+// для разработчика — пользователю, что делать, говорят error_code и error_hint.
+export async function getJobLog(jobId: string, tail = 16 * 1024): Promise<string> {
+  const res = await send(`/convert/log/${jobId}?tail=${tail}`);
+  if (!res.ok) throw await failure(res, "Лог недоступен");
+  return (await res.json()).text as string;
+}
+
 // Отменяет задачу (п.4.6). Задачу из очереди снимает сразу, идущий скан
 // прекращает на ближайшей проверке — итог приходит обычным опросом статуса.
 // Нативный режим и доочистку на ходу прервать нельзя: сервер честно отвечает

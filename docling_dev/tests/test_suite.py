@@ -3655,12 +3655,20 @@ def test_abort_request_raises_on_check(clean_abort):
     assert exc.value.code == "CANCELLED"
 
 
-def test_abort_deadline_becomes_timeout(clean_abort):
+def test_abort_deadline_becomes_timeout(clean_abort, monkeypatch):
     """Срок считается в той же проверке: отдельный таймер потребовал бы ещё
-    одного потока, а проверка и так зовётся на каждой странице."""
+    одного потока, а проверка и так зовётся на каждой странице.
+
+    Время подменяем, а не спим: на Windows `time.monotonic()` тикает раз в
+    ~15.6 мс, и короткий sleep может вообще не сдвинуть счётчик — тест на
+    настоящем сне получается плавающим (поймано на прогоне)."""
+    import time as _time
     from docling_dev.errors import JobAborted
-    clean_abort.start(0.001)
-    time.sleep(0.01)
+    clean_abort.start(30.0)
+    clean_abort.check()                          # срок ещё не истёк
+    later = _time.monotonic() + 3600
+    monkeypatch.setattr(clean_abort, "time",
+                        types.SimpleNamespace(monotonic=lambda: later))
     with pytest.raises(JobAborted) as exc:
         clean_abort.check()
     assert exc.value.code == "TIMEOUT"
@@ -3855,3 +3863,132 @@ def test_cancel_running_polish_is_honest_409(cancel_client):
     r = client.post("/convert/cancel/доочистка")
     assert r.status_code == 409
     assert "модели" in r.json()["detail"]
+
+
+#  ЛОГ НА ЗАДАЧУ (п.4.7)
+
+
+def test_joblog_writes_our_records(tmp_path, monkeypatch):
+    import logging
+    from docling_dev import joblog
+    monkeypatch.delenv("CONVERTER_JOB_LOG_LEVEL", raising=False)
+    with joblog.capture(tmp_path, "задача-1") as handler:
+        assert handler is not None
+        logging.getLogger("docling_dev.проверка").info("строка из конвертера")
+    text = joblog.log_path(tmp_path).read_text(encoding="utf-8")
+    assert "строка из конвертера" in text
+    assert "задача-1" in text                    # отметки начала и конца
+
+
+def test_joblog_works_when_app_set_root_to_warning(tmp_path, monkeypatch):
+    """Приложение настраивает логирование само (в sberAct — своё), и при
+    корневом WARNING наши INFO-строки не доходили бы даже до обработчика:
+    логгер отсекает запись раньше. Поэтому уровень поднимается на время задачи."""
+    import logging
+    from docling_dev import joblog
+    monkeypatch.delenv("CONVERTER_JOB_LOG_LEVEL", raising=False)
+    ours = logging.getLogger("docling_dev")
+    saved = ours.level
+    ours.setLevel(logging.WARNING)
+    try:
+        with joblog.capture(tmp_path, "задача-2"):
+            logging.getLogger("docling_dev.проверка").info("важная строка")
+        assert "важная строка" in joblog.log_path(tmp_path).read_text(encoding="utf-8")
+        assert ours.level == logging.WARNING      # уровень вернули
+    finally:
+        ours.setLevel(saved)
+
+
+def test_joblog_detaches_handler_after_block(tmp_path, monkeypatch):
+    """Обработчик обязан сниматься: иначе лог следующей задачи попадёт в
+    предыдущую, а файлы будут висеть открытыми."""
+    import logging
+    from docling_dev import joblog
+    monkeypatch.delenv("CONVERTER_JOB_LOG_LEVEL", raising=False)
+    before = len(logging.getLogger().handlers)
+    with joblog.capture(tmp_path, "задача-3"):
+        logging.getLogger("docling_dev.проверка").info("внутри")
+    assert len(logging.getLogger().handlers) == before
+    logging.getLogger("docling_dev.проверка").info("снаружи")
+    text = joblog.log_path(tmp_path).read_text(encoding="utf-8")
+    assert "внутри" in text and "снаружи" not in text
+
+
+def test_joblog_skips_http_noise(tmp_path, monkeypatch):
+    """Опрос статуса идёт раз в секунду — в логе задачи ему делать нечего."""
+    import logging
+    from docling_dev import joblog
+    monkeypatch.delenv("CONVERTER_JOB_LOG_LEVEL", raising=False)
+    with joblog.capture(tmp_path, "задача-4"):
+        logging.getLogger("uvicorn.access").info("GET /convert/status/x 200")
+        logging.getLogger("httpx").info("HTTP Request: GET /convert/status/x")
+        logging.getLogger("docling_dev.проверка").info("наша строка")
+    text = joblog.log_path(tmp_path).read_text(encoding="utf-8")
+    assert "наша строка" in text
+    assert "/convert/status" not in text
+
+
+def test_joblog_off_writes_nothing(tmp_path, monkeypatch):
+    import logging
+    from docling_dev import joblog
+    monkeypatch.setenv("CONVERTER_JOB_LOG_LEVEL", "off")
+    with joblog.capture(tmp_path, "задача-5") as handler:
+        assert handler is None
+        logging.getLogger("docling_dev.проверка").info("не должно записаться")
+    assert not joblog.log_path(tmp_path).exists()
+
+
+def test_joblog_failure_does_not_break_the_job(tmp_path, monkeypatch):
+    """Лог — диагностика, а не результат: если файл не открылся, конвертация
+    обязана идти дальше."""
+    import logging
+    from docling_dev import joblog
+    monkeypatch.delenv("CONVERTER_JOB_LOG_LEVEL", raising=False)
+    monkeypatch.setattr(joblog, "RotatingFileHandler",
+                        lambda *a, **kw: (_ for _ in ()).throw(OSError("диск")))
+    done = []
+    before = len(logging.getLogger().handlers)
+    with joblog.capture(tmp_path, "задача-6") as handler:
+        assert handler is None
+        done.append(True)
+    assert done == [True]
+    assert len(logging.getLogger().handlers) == before
+
+
+def test_joblog_read_tail_marks_cut(tmp_path):
+    from docling_dev import joblog
+    joblog.log_path(tmp_path).write_text("\n".join(f"строка {i}" for i in range(2000)),
+                                         encoding="utf-8")
+    tail = joblog.read_tail(tmp_path, 2048)
+    assert "показаны последние" in tail.splitlines()[0]
+    assert "строка 1999" in tail
+    assert "строка 0\n" not in tail
+
+
+def test_joblog_read_tail_without_file(tmp_path):
+    from docling_dev import joblog
+    assert joblog.read_tail(tmp_path) == ""
+
+
+def test_log_endpoint_returns_text(jobs_disk, monkeypatch):
+    """Лог лежит рядом с файлами задачи, поэтому доступен и после перезапуска
+    сервера — как и сам результат (п.4.5)."""
+    client, _api, put, tmp = jobs_disk
+    d = put("задача-лог", DONE_JOB)
+    (d / "job.log").write_text("строка лога\n", encoding="utf-8")
+    r = client.get("/convert/log/задача-лог")
+    assert r.status_code == 200
+    assert "строка лога" in r.json()["text"]
+
+
+def test_log_endpoint_404_without_log(jobs_disk):
+    client, _api, put, _tmp = jobs_disk
+    put("задача-без-лога", DONE_JOB)
+    r = client.get("/convert/log/задача-без-лога")
+    assert r.status_code == 404
+    assert "CONVERTER_JOB_LOG_LEVEL" in r.json()["detail"]
+
+
+def test_log_endpoint_404_for_unknown_job(jobs_disk):
+    client, *_ = jobs_disk
+    assert client.get("/convert/log/нет-такой").status_code == 404

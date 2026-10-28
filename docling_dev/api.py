@@ -283,7 +283,20 @@ def _page_count(pdf_path: Path) -> int:
 #Фоновые воркеры (продолжение)
 
 def _run_scan(job_id: str, pdf_path: Path, docx_path: Path, flags: dict) -> None:
-    """Прогон скана через Docling-пайплайн (медленный путь)."""
+    """Прогон скана под записью лога задачи (пункт 4.7).
+
+    Лог пишется рядом с файлами задачи: на машине пользователя общий лог
+    сервера недоступен (в sberAct stdout сайдкара уходит в console.log
+    Electron), а разбирать сбои как-то надо.
+    """
+    from . import joblog
+    with joblog.capture(pdf_path.parent, job_id):
+        _run_scan_body(job_id, pdf_path, docx_path, flags)
+
+
+def _run_scan_body(job_id: str, pdf_path: Path, docx_path: Path,
+                   flags: dict) -> None:
+    """Собственно прогон скана через Docling-пайплайн (медленный путь)."""
     from . import abort, progress as page_progress
     from .errors import ConvertError, classify
     aborted = None
@@ -349,7 +362,14 @@ def _run_scan(job_id: str, pdf_path: Path, docx_path: Path, flags: dict) -> None
 
 
 def _run_native(job_id: str, pdf_path: Path, docx_path: Path) -> None:
-    """Прогон нативного PDF через pdf2docx (быстрый путь, без флагов)."""
+    """Прогон нативного PDF под записью лога задачи (пункт 4.7)."""
+    from . import joblog
+    with joblog.capture(pdf_path.parent, job_id):
+        _run_native_body(job_id, pdf_path, docx_path)
+
+
+def _run_native_body(job_id: str, pdf_path: Path, docx_path: Path) -> None:
+    """Собственно прогон нативного PDF через pdf2docx (без флагов)."""
     from .errors import ConvertError, classify
     try:
         _set(job_id, status="running", stage="Конвертация PDF…", progress=0.2)
@@ -664,6 +684,13 @@ async def convert_status(job_id: str):
 
 
 def _run_polish(job_id: str, docx_path: Path) -> None:
+    """Доочистка под записью лога задачи (пункт 4.7)."""
+    from . import joblog
+    with joblog.capture(docx_path.parent, job_id):
+        _run_polish_body(job_id, docx_path)
+
+
+def _run_polish_body(job_id: str, docx_path: Path) -> None:
     """LLM-доочистка уже готового DOCX (пункт 3.2).
 
     Распознавание и разметка не повторяются: подсветка сохранена в самом файле,
@@ -730,6 +757,33 @@ async def convert_polish(job_id: str):
         raise HTTPException(status_code=410, detail="Результат недоступен.")
     _FUTURES[job_id] = _EXECUTOR.submit(_run_polish, job_id, docx_path)
     return {"job_id": job_id, "status": "queued"}
+
+
+@router.get("/log/{job_id}")
+async def convert_log(job_id: str, tail: int = 64 * 1024):
+    """Лог задачи (пункт 4.7): что именно происходило во время работы.
+
+    Отдаётся ХВОСТ файла (по умолчанию последние 64 КБ) — интересно то, что
+    было перед сбоем. Лог лежит рядом с файлами задачи, поэтому доступен и
+    после перезапуска сервера.
+
+    Это диагностика для разработчика, а не сообщение пользователю: что делать,
+    говорят `error_code` и `error_hint` в статусе задачи.
+    """
+    from . import joblog
+    _ensure_restored()
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Задача не найдена.")
+        docx_path = Path(job["docx_path"])
+    text = joblog.read_tail(docx_path.parent, max(int(tail), 1024))
+    if not text:
+        raise HTTPException(status_code=404,
+                            detail="Лог этой задачи недоступен: он мог быть "
+                                   "отключён (CONVERTER_JOB_LOG_LEVEL=off) или "
+                                   "удалён вместе с временными файлами.")
+    return {"job_id": job_id, "text": text}
 
 
 @router.get("/download/{job_id}")
