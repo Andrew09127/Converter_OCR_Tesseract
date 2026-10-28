@@ -134,20 +134,11 @@ class PDFPipelineConverter:
             logging.info("Полнота текста %s: OK — потерь не найдено", pdf_path.name)
             return
 
-        try:
-            d.add_page_break()
-            d.add_paragraph("[Восстановленный текст — pdf2docx не перенёс эти строки в вёрстку]")
-            cur_page = None
-            for page_no, s in missing:
-                if page_no != cur_page:     # заголовок-ориентир: откуда взята строка
-                    cur_page = page_no
-                    d.add_paragraph(f"— страница {page_no} —")
-                d.add_paragraph(s)
-            d.save(str(docx_path))
-            logging.warning("%s: pdf2docx потерял %d строк — дописаны в конец DOCX "
-                            "(полнота восстановлена)", pdf_path.name, len(missing))
-        except Exception as exc:
-            logging.error("Полнота: не дописать восстановленный текст в %s: %s", docx_path.name, exc)
+        # По решению Андрея хвостовой блок «[Восстановленный текст …]» в DOCX больше НЕ
+        # дописываем (он захламлял конец документа подвалом/почтой). Потери только
+        # ЛОГИРУЕМ — сам DOCX не трогаем, вёрстка остаётся чистой.
+        logging.warning("%s: pdf2docx потерял %d строк — НЕ дописываем в DOCX "
+                        "(блок восстановления отключён по решению)", pdf_path.name, len(missing))
 
     # Длина окна n-грамм: сколько подряд идущих слов PDF склеиваем в один ключ.
     # 6 покрывает реальные склейки pdf2docx (обычно 2-4 слова) с запасом.
@@ -164,12 +155,15 @@ class PDFPipelineConverter:
         словарной сегментации, поэтому корректные слова не шинкуются."""
         glue: dict[str, list[int]] = {}
         singles: set[str] = set()           # самостоятельные слова PDF — их НЕ трогаем
+        # Строки по блокам (в порядке следования) — для склеек на стыке соседних строк.
+        by_block: dict[tuple, list[list[str]]] = {}
         for page in pdf:
             # (x0, y0, x1, y1, "word", block_no, line_no, word_no)
             words = page.get_text("words")
             words.sort(key=lambda w: (w[5], w[6], w[7]))
-            for _, line in groupby(words, key=lambda w: (w[5], w[6])):
+            for (blk, _ln), line in groupby(words, key=lambda w: (w[5], w[6])):
                 toks = [w[4] for w in line]
+                by_block.setdefault((page.number, blk), []).append(toks)
                 for i in range(len(toks)):
                     acc, bounds = "", []
                     for n in range(1, cls._GLUE_MAX_N + 1):
@@ -184,6 +178,20 @@ class PDFPipelineConverter:
                             # setdefault: при коллизии оставляем самую короткую (раннюю)
                             # разбивку — она однозначнее
                             glue.setdefault(acc.lower(), list(bounds))
+        # СКЛЕЙКА НА СТЫКЕ СОСЕДНИХ СТРОК ОДНОГО БЛОКА: слово/словосочетание перенесено
+        # на след. строку, а pdf2docx убрал и перенос, и пробел («Центрального»⏎
+        # «федерального» → «Центральногофедерального»). Обычный перенос → вставляем
+        # пробел на стыке (граница = длина левого слова). Дефис-перенос («об-»/«ласти»)
+        # здесь НЕ трогаем — это снятие дефиса, иная операция (отдельный шаг).
+        for lines in by_block.values():
+            for k in range(len(lines) - 1):
+                left, right = lines[k], lines[k + 1]
+                if not left or not right:
+                    continue
+                a, b2 = left[-1], right[0]
+                if not a or not b2 or a.endswith("-"):
+                    continue
+                glue.setdefault((a + b2).lower(), [len(a)])
         # Защита от ложных разрезов: если склеенная форма совпадает с реальным
         # самостоятельным словом (напр. «дело» = «дел» + «о»), не расклеиваем его.
         for key in singles:
@@ -291,6 +299,48 @@ class PDFPipelineConverter:
             except Exception as exc:
                 logging.error("Расклейка: не сохранить %s: %s", docx_path.name, exc)
 
+    # Закрывающая кавычка », у которой ПЕРЕД ней пробел, а ПОСЛЕ — буква: это на деле
+    # ОТКРЫВАЮЩАЯ кавычка, неверно повёрнутая pdf2docx при конвертации прямых кавычек
+    # («… "ДЕЛО"» распозналось как «… »ДЕЛО»»). Диапазоны кириллицы — unicode-escape'ами,
+    # чтобы не зависеть от кодировки исходника. Настоящая закрывающая » идёт вплотную
+    # к слову (без пробела перед), поэтому такой случай сюда не попадает.
+    _MISPLACED_OPEN_QUOTE_RE = re.compile(
+        "(?<=\\s)»(?=[А-Яа-яЁёA-Za-z])"
+    )
+
+    def _fix_quote_direction(self, docx_path) -> None:
+        """Чинит неверно повёрнутую кавычку »→« (см. _MISPLACED_OPEN_QUOTE_RE)."""
+        try:
+            d = Document(str(docx_path))
+        except Exception as exc:
+            logging.warning("Кавычки: не открыть DOCX %s: %s", docx_path.name, exc)
+            return
+
+        def fix_paragraph(paragraph) -> int:
+            n = 0
+            for run in paragraph.runs:
+                if "»" in run.text:
+                    new = self._MISPLACED_OPEN_QUOTE_RE.sub("«", run.text)
+                    if new != run.text:
+                        run.text = new
+                        n += 1
+            return n
+
+        changed = 0
+        for paragraph in d.paragraphs:
+            changed += fix_paragraph(paragraph)
+        for table in d.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        changed += fix_paragraph(paragraph)
+        if changed:
+            try:
+                d.save(str(docx_path))
+                logging.info("Кавычки %s: повёрнуто »→« — %d", docx_path.name, changed)
+            except Exception as exc:
+                logging.error("Кавычки: не сохранить %s: %s", docx_path.name, exc)
+
     def convert_single_pdf(self, pdf_path, docx_path):
         """Конвертация одного PDF в редактируемый DOCX"""
         converter = None
@@ -309,6 +359,9 @@ class PDFPipelineConverter:
             # ВАЖНО до _recover_missing_text — расклеенный текст лучше сверяется
             # пословно, поэтому ложных «потерь» меньше.
             self._fix_glued_words(pdf_path, docx_path)
+
+            # Кавычки: pdf2docx мог неверно повернуть открывающую кавычку (»ДЕЛО → «ДЕЛО).
+            self._fix_quote_direction(docx_path)
 
             # Гарантия полноты: дописываем текст, который pdf2docx потерял
             self._recover_missing_text(pdf_path, docx_path)

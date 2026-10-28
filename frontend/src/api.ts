@@ -182,6 +182,17 @@ export async function getProfile(): Promise<MachineProfile> {
   return (await res.json()) as MachineProfile;
 }
 
+// Просит сервер прогреть движок, ничего не ожидая взамен. Импорт docling с
+// torch стоит 11 с, и после перехода пакета на ленивые импорты за него платит
+// первая конвертация скана. Поэтому зовём сразу после классификации: пока
+// пользователь смотрит на выбор режима, модели уже грузятся. Нативному PDF
+// движок не нужен вовсе, для него не зовём.
+export function warmupInBackground(): void {
+  void send("/convert/warmup", { method: "POST" }).catch(() => {
+    // Прогрев необязателен: не вышло — первая задача построит движок сама.
+  });
+}
+
 // Лог задачи (п.4.7): что именно происходило во время работы. Это диагностика
 // для разработчика — пользователю, что делать, говорят error_code и error_hint.
 export async function getJobLog(jobId: string, tail = 16 * 1024): Promise<string> {

@@ -41,7 +41,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 
 
 def _tesseract() -> dict:
-    from .pipeline import resolve_tesseract_cmd
+    from .vendored import resolve_tesseract_cmd
     cmd = resolve_tesseract_cmd()
     item: dict = {"name": "tesseract", "critical": True, "cmd": cmd}
     try:
@@ -63,7 +63,7 @@ def _tesseract() -> dict:
 
 
 def _docling_models() -> dict:
-    from .pipeline import _DOCLING_MODELS_DIR
+    from .vendored import _DOCLING_MODELS_DIR
     d = Path(_DOCLING_MODELS_DIR)
     item: dict = {"name": "модели Docling", "critical": True, "path": str(d)}
     if not d.is_dir():
@@ -90,7 +90,9 @@ def _docling_models() -> dict:
 
 
 def _llm_model(deep: bool) -> dict:
-    from .llm_correct import _DEFAULT_MODEL
+    # Путь берём из `vendored`, а НЕ из `llm_correct`: тот импортирует
+    # `highlight`, то есть словарь pymorphy — проверке готовности это незачем.
+    from .vendored import _LLM_MODEL as _DEFAULT_MODEL
     item: dict = {"name": "LLM-модель (gguf)", "critical": False,
                   "path": _DEFAULT_MODEL}
     if deep:

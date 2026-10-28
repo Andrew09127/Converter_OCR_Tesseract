@@ -189,7 +189,7 @@ def check_temp_dir() -> None:
     генерацией его нет, и распознавание даёт пустые страницы без объяснения.
     """
     import tempfile
-    from .pipeline import _ascii_safe_path
+    from .vendored import _ascii_safe_path
     tmp = tempfile.gettempdir()
     if tmp.isascii():
         return

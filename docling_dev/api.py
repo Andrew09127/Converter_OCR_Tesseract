@@ -102,6 +102,10 @@ _HEALTH_TTL = 10.0
 _OCR_READER: list = []          # [reader] или [] ; None-маркер недоступности — [None]
 _OCR_READER_LOCK = threading.Lock()
 
+# Готовность движка. Импорт docling с torch занимает 15-40 с, и раньше он
+# приходился на первую конвертацию — уже после того, как /health сказал «готов».
+_ENGINE_READY = threading.Event()
+
 
 # Задачи восстанавливаются лениво, при первом обращении к статусу или файлу.
 # Событие старта не годится: в sberAct подключают только наш роутер, своё
@@ -265,7 +269,29 @@ def _get_scan_converter(ocr_preprocess: bool, profile: str | None = None):
             _SCAN_CACHE.update(key=key,
                                conv=build_converter(ocr_preprocess=key[0],
                                                     profile=key[1]))
+        # Движок построен: на этот флаг смотрят `main.py` и `/health`.
+        if not key[0]:
+            _ENGINE_READY.set()
         return _SCAN_CACHE["conv"]
+
+
+def engine_ready() -> bool:
+    """Загружен ли docling. False — первая конвертация ещё подождёт импорт."""
+    return _ENGINE_READY.is_set()
+
+
+def start_warmup() -> None:
+    """Греет движок в фоне, не задерживая ответ сервера.
+
+    Зовётся из `main.py` при `CONVERTER_WARMUP=1`. Внутри — тот же прогрев, что
+    и у `POST /convert/warmup` (`docling_dev/warmup.py`): он идемпотентен,
+    поэтому прогрев при старте и прогрев по запросу не делают работу дважды.
+    Вариант без предобработки: им идёт обычная конвертация скана, а
+    ocr_preprocess=True включают редко и вручную.
+    """
+    from . import warmup as warm
+
+    threading.Thread(target=warm.warmup, name="warmup", daemon=True).start()
 
 
 def _get_ocr_reader():

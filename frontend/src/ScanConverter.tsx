@@ -34,6 +34,7 @@ import {
   getJobLog,
   getSettings,
   saveSettings,
+  warmupInBackground,
   getHealth,
   getProfile,
   pollUntilDone,
@@ -202,6 +203,9 @@ export default function ScanConverter() {
       .then((res) => {
         setSuggestedMode(res.suggested);
         setStatus(res.reason);
+        // Скан — значит движок понадобится: греем, пока пользователь выбирает
+        // режим. Нативному PDF он не нужен, за него не платим.
+        if (res.suggested === "scan") warmupInBackground();
       })
       .catch(() => {
         // Анализ не критичен: при сбое просто не подсвечиваем, режим выбирает пользователь.

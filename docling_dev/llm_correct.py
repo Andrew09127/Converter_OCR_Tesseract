@@ -28,10 +28,9 @@ from .highlight import _iter_paragraphs
 log = logging.getLogger(__name__)
 
 # Модель по умолчанию — вендоренный .gguf в папке models/ рядом с проектом.
-_DEFAULT_MODEL = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "models", "qwen2.5-1.5b-instruct-q4_k_m.gguf",
-)
+# Путь лежит в `vendored.py`: оттуда же его берёт проверка готовности, которой
+# нельзя импортировать этот модуль (он тянет словарь pymorphy).
+from .vendored import _LLM_MODEL as _DEFAULT_MODEL
 
 # Настройки стоимости LLM-доочистки (см. handoff.md, правка п.1.3):
 #   CONVERTER_LLM_THREADS — потоки префилла. Тяжёлый префилл идёт по

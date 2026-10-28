@@ -3365,7 +3365,7 @@ def test_check_temp_dir_flags_unusable_temp(monkeypatch, tmp_path):
     страницы без объяснения, поэтому говорим об этом заранее."""
     from docling_dev import errors
     monkeypatch.setattr("tempfile.gettempdir", lambda: r"C:\Врем")
-    monkeypatch.setattr("docling_dev.pipeline._ascii_safe_path", lambda p: None)
+    monkeypatch.setattr("docling_dev.vendored._ascii_safe_path", lambda p: None)
     with pytest.raises(errors.ConvertError) as exc:
         errors.check_temp_dir()
     assert exc.value.code == "PATH_NON_ASCII"
@@ -3376,7 +3376,7 @@ def test_check_temp_dir_accepts_short_name(monkeypatch):
     """Короткое имя 8.3 — штатный обходной путь, он должен приниматься."""
     from docling_dev import errors
     monkeypatch.setattr("tempfile.gettempdir", lambda: r"C:\Врем")
-    monkeypatch.setattr("docling_dev.pipeline._ascii_safe_path",
+    monkeypatch.setattr("docling_dev.vendored._ascii_safe_path",
                         lambda p: r"C:\VREM~1")
     errors.check_temp_dir()                      # не бросает
 

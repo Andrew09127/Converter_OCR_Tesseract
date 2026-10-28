@@ -14,6 +14,7 @@ main.py
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -36,7 +37,11 @@ _HERE = Path(__file__).parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from docling_dev.api import router as converter_router
+from docling_dev.api import router as converter_router, engine_ready, start_warmup
+# Теневые LLM-подсказки по полям. Живут здесь же, потому что здесь уже есть и
+# llama-cpp, и файл модели, и жизненный цикл процесса (запуск по требованию,
+# выгрузка по простою) — второй такой рантайм в бэкенде пришлось бы кормить
+# теми же 2.3 ГБ и отдельно решать под Astra Linux.
 
 app = FastAPI(title="PDF → Word конвертер (локальный)")
 
@@ -52,9 +57,29 @@ app.add_middleware(
 app.include_router(converter_router)
 
 
+# CONVERTER_WARMUP сводит два прежних смысла в один контракт:
+#   не задана       — при старте не греем, но POST /convert/warmup работает;
+#   1|eager|on|true — греем сразу при старте процесса;
+#   0|off|no|false  — не греем вообще, маршрут отвечает «skipped».
+_WARMUP_EAGER = ("1", "eager", "on", "true", "yes")
+
+
+@app.on_event("startup")
+async def _warmup() -> None:
+    """Прогрев движка при старте — по требованию (CONVERTER_WARMUP=1).
+
+    По умолчанию выключен: нативным PDF движок не нужен вовсе, а он тянет
+    docling с torch на 15-40 с и гигабайты памяти. Кто знает, что документ
+    сканированный, зовёт POST /convert/warmup — фронт делает это сразу после
+    классификации, пока пользователь ещё смотрит на выбор режима.
+    """
+    if os.environ.get("CONVERTER_WARMUP", "").strip().lower() in _WARMUP_EAGER:
+        start_warmup()
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "converter_ready": engine_ready()}
 
 
 # Если фронт уже собран (frontend/dist) — раздаём его статикой по корню,
