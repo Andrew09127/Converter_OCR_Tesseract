@@ -60,8 +60,16 @@ def main() -> int:
         if not os.path.basename(f).startswith("~$")
     )
     if not docx_files:
-        print("Нет DOCX в", OUT_DIR)
-        return 1
+        # Не провал: эталоны и исходные DOCX есть только на машине с корпусом
+        # (в них ФИО и адреса, в git их держать нельзя). То же правило, что у
+        # tests/highlights.py — пропуск, а не ошибка.
+        print(f"пропуск: нет DOCX в {src_dir} — сначала сконвертируйте сканы")
+        return 0
+
+    if mode == "check" and not glob.glob(os.path.join(GOLDEN_DIR, "*.txt")):
+        print(f"пропуск: эталонов нет в {GOLDEN_DIR} — снимите их командой "
+              f"`python tests/golden.py save`")
+        return 0
 
     if mode == "save":
         for f in docx_files:

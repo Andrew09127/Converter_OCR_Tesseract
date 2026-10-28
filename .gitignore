@@ -59,3 +59,9 @@ models/*.gguf
 # куски *.safetensors.partNNN, склеиваются при первом запуске
 # (pipeline._ensure_docling_models).
 models/docling/**/*.safetensors
+
+# Эталоны вёрстки golden — это ТЕКСТ реальных документов (ФИО, адреса, СНИЛС),
+# в git их держать нельзя. Снимаются локально по корпусу сканов
+# (tests/golden.py save), как и разметка подсветки highlight_labels.json.
+# На машине без них golden check печатает «пропуск» и возвращает 0.
+tests/golden/
